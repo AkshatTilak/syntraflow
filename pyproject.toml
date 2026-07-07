@@ -1,0 +1,48 @@
+[project]
+name = "syntraflow"
+version = "0.1.0"
+description = "Multi-Agent Document Extraction & Synthesis Engine"
+authors = [
+    {name = "Akshat Tilak"}
+]
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+    "langchain>=0.3.0",
+    "langgraph>=0.2.0",
+    "qdrant-client>=1.11.0",
+    "pyspark>=3.5.0",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.0",
+    "aiortc>=1.9.0",
+    "mlflow>=2.15.0",
+    "mcp>=0.1.0",
+    "sentence-transformers>=3.0.0",
+]
+
+[tool.poetry]
+packages = [{include = "src"}]
+
+[dependency-groups]
+dev = [
+    "black>=24.8.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+]
+test = [
+    "pytest>=8.3.0",
+    "pytest-mock>=3.14.0",
+    "pytest-asyncio>=0.24.0",
+    "deepeval>=1.2.0",
+    "ragas>=0.2.0",
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
