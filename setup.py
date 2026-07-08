@@ -10,8 +10,6 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 
 from common.clients.inference import InferenceClient
 from common.observability.logger import get_logger
-from projects.syntraflow.src.database.client import engine
-from projects.syntraflow.src.database.models import Base
 from projects.syntraflow.src.vectors.client import VectorClient
 
 logger = get_logger("syntraflow")
@@ -19,14 +17,7 @@ logger = get_logger("syntraflow")
 
 async def init_app_state(app: FastAPI, settings) -> None:
     """Initialize SyntraFlow database schemas, collections, and state on gateway startup."""
-    # 1. Create SQL database tables if they do not exist
-    try:
-        Base.metadata.create_all(bind=engine)
-        logger.info("SyntraFlow SQL database tables verified/created successfully.")
-    except Exception as e:
-        logger.error("Failed to initialize database tables: %s", e)
-
-    # 2. Ensure Qdrant collection exists
+    # 1. Ensure Qdrant collection exists
     try:
         v_client = VectorClient()
         qc = v_client.get_client()
