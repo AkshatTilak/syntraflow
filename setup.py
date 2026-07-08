@@ -68,9 +68,25 @@ async def init_app_state(app: FastAPI, settings) -> None:
         settings.INFERENCE_SERVER_URL,
     )
 
+    # 3. Start background consumer task
+    import asyncio
+    from projects.syntraflow.src.worker import run_ingestion_consumer
+    app.state.syntraflow_consumer_task = asyncio.create_task(run_ingestion_consumer(app))
+    logger.info("SyntraFlow background consumer task started.")
+
 
 async def shutdown_app_state(app: FastAPI, settings) -> None:
     """Clean up SyntraFlow state on gateway shutdown."""
+    import asyncio
+    if hasattr(app.state, "syntraflow_consumer_task"):
+        logger.info("Stopping SyntraFlow background consumer task...")
+        app.state.syntraflow_consumer_task.cancel()
+        try:
+            await app.state.syntraflow_consumer_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("SyntraFlow background consumer task stopped.")
+
     if hasattr(app.state, "syntraflow_inference"):
         await app.state.syntraflow_inference.close()
     logger.info("SyntraFlow shut down")

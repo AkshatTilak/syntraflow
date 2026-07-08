@@ -122,11 +122,12 @@ async def query_database(table: str, filters: Dict[str, Any], columns: List[str]
         sql_str += " WHERE " + " AND ".join(where_clauses)
 
     try:
-        db_generator = get_db()
-        db: Session = next(db_generator)
-        result = db.execute(text(sql_str), params)
-        rows = [dict(r._mapping) for r in result]
-        return json.dumps(rows, default=str)
+        from common.clients.postgres import get_sessionmaker
+        SessionLocal = get_sessionmaker()
+        async with SessionLocal() as db:
+            result = await db.execute(text(sql_str), params)
+            rows = [dict(r._mapping) for r in result]
+            return json.dumps(rows, default=str)
     except Exception as e:
         logger.error("DB Query error: %s", e)
         return json.dumps({"error": f"Database query failed: {str(e)}"})
@@ -153,15 +154,8 @@ async def query_graph(cypher_query: str) -> str:
         return json.dumps({"error": "Unauthorized: Cypher queries must only query SyntraFlow_ prefixes."})
 
     try:
-        from neo4j import GraphDatabase
-        driver = GraphDatabase.driver(
-            settings.NEO4J_URL,
-            auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD)
-        )
-        with driver.session() as session:
-            result = session.run(cypher_query)
-            records = [dict(r) for r in result]
-        driver.close()
+        from common.clients.neo4j import execute_read_query
+        records = await execute_read_query(cypher_query)
         return json.dumps(records, default=str)
     except Exception as e:
         logger.error("Graph Query error: %s", e)

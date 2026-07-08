@@ -47,30 +47,24 @@ class RetrievalEngine:
     async def search_graph(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """Traverse relationships in Neo4j to find linked entities/community summaries."""
         try:
-            from neo4j import GraphDatabase
-            driver = GraphDatabase.driver(
-                settings.NEO4J_URL,
-                auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD)
+            from common.clients.neo4j import execute_read_query
+            
+            cypher_query = (
+                "MATCH (e:SyntraFlow_Entity)-[r:SyntraFlow_RELATION]->(o:SyntraFlow_Entity) "
+                "WHERE e.name CONTAINS $query OR o.name CONTAINS $query "
+                "RETURN e.name AS source, o.name AS target, r.type AS rel_type "
+                "LIMIT $limit"
             )
+            records = await execute_read_query(cypher_query, {"query": query, "limit": limit})
             hits = []
-            with driver.session() as session:
-                # Retrieve matching entities and their claims / relations
-                cypher_query = (
-                    "MATCH (e:SyntraFlow_Entity)-[r:SyntraFlow_RELATION]->(o:SyntraFlow_Entity) "
-                    "WHERE e.name CONTAINS $query OR o.name CONTAINS $query "
-                    "RETURN e.name AS source, o.name AS target, r.type AS rel_type "
-                    "LIMIT $limit"
-                )
-                result = session.run(cypher_query, query=query, limit=limit)
-                for rec in result:
-                    text_repr = f"Relationship: {rec['source']} -> {rec['rel_type']} -> {rec['target']}"
-                    hits.append({
-                        "id": hash(text_repr),
-                        "score": 1.0,
-                        "text": text_repr,
-                        "metadata": {"type": "graph_relation"}
-                    })
-            driver.close()
+            for rec in records:
+                text_repr = f"Relationship: {rec['source']} -> {rec['rel_type']} -> {rec['target']}"
+                hits.append({
+                    "id": hash(text_repr),
+                    "score": 1.0,
+                    "text": text_repr,
+                    "metadata": {"type": "graph_relation"}
+                })
             return hits
         except Exception as e:
             logger.warning("Neo4j graph traversal failed or not configured: %s", e)

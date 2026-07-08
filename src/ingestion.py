@@ -8,7 +8,7 @@ import base64
 import json
 import logging
 from typing import Any, List, Optional
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from qdrant_client.http.models import PointStruct
 
 from common.config.settings import settings
@@ -115,55 +115,102 @@ async def extract_graph_entities(text: str) -> dict:
 
 
 async def write_to_neo4j(graph_data: dict) -> None:
-    """Write extracted entities and relationships to Neo4j database."""
-    # Prevent circular imports or issues if Neo4j is not configured
+    """Write extracted entities and relationships to Neo4j database using the shared async client."""
     try:
-        from neo4j import GraphDatabase
-        url = settings.NEO4J_URL
-        user = settings.NEO4J_USER
-        password = settings.NEO4J_PASSWORD
-        
-        driver = GraphDatabase.driver(url, auth=(user, password))
-        with driver.session() as session:
+        from common.clients.neo4j import get_neo4j_driver
+        driver = get_neo4j_driver()
+        async with driver.session() as session:
             # 1. Create entities (prefixed with SyntraFlow_)
             for ent in graph_data.get("entities", []):
-                session.run(
+                await session.run(
                     "MERGE (e:SyntraFlow_Entity {name: $name}) ON CREATE SET e.type = $type",
                     name=ent["name"], type=ent["type"]
                 )
             # 2. Create relationships
             for rel in graph_data.get("relationships", []):
-                session.run(
+                await session.run(
                     "MATCH (a:SyntraFlow_Entity {name: $source}), (b:SyntraFlow_Entity {name: $target}) "
                     "MERGE (a)-[r:SyntraFlow_RELATION {type: $relation}]->(b)",
                     source=rel["source"], target=rel["target"], relation=rel["relation"]
                 )
-        driver.close()
     except Exception as e:
         logger.warning("Could not write to Neo4j: %s. Proceeding with database and vector writes.", e)
+
+
+async def update_job(
+    db: AsyncSession,
+    job_id: Optional[Any],
+    progress: float,
+    status: str = "processing",
+    error_msg: Optional[str] = None,
+) -> None:
+    """Helper to update ingestion job status and progress in the database."""
+    if not job_id:
+        return
+    try:
+        from datetime import datetime
+        from sqlalchemy import update
+        from projects.syntraflow.src.database.models import SyntraFlowJob
+
+        stmt = (
+            update(SyntraFlowJob)
+            .where(SyntraFlowJob.id == job_id)
+            .values(
+                status=status,
+                progress=progress,
+                error_msg=error_msg,
+                updated_at=datetime.utcnow(),
+            )
+        )
+        await db.execute(stmt)
+        await db.commit()
+    except Exception as e:
+        logger.error("Failed to update job status: %s", e)
 
 
 async def ingest_document_pipeline(
     file_bytes: bytes,
     filename: str,
-    db: Session,
+    db: AsyncSession,
     inference_client: InferenceClient,
     vector_client: VectorClient,
-) -> int:
+    job_id: Optional[Any] = None,
+) -> Any:
     """Ingest a multi-page PDF/image document."""
+    await update_job(db, job_id, progress=0.1, status="processing")
+
     # 1. Extract Layout and text using OCR
     ocr_result = await extract_layout_ocr(file_bytes, filename, inference_client)
     extracted_text = ocr_result.get("text", "")
+    await update_job(db, job_id, progress=0.4, status="processing")
     
     # 2. Save Document to Postgres
+    import hashlib
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
     doc = SyntraFlowDocument(
         filename=filename,
+        file_hash=file_hash,
         content=extracted_text,
         layout_json=json.dumps(ocr_result)
     )
     db.add(doc)
-    db.commit()
-    db.refresh(doc)
+    await db.commit()
+    await db.refresh(doc)
+
+    # Link document to job
+    if job_id:
+        from projects.syntraflow.src.database.models import SyntraFlowJob
+        from sqlalchemy import update
+        try:
+            stmt = (
+                update(SyntraFlowJob)
+                .where(SyntraFlowJob.id == job_id)
+                .values(document_id=doc.id)
+            )
+            await db.execute(stmt)
+            await db.commit()
+        except Exception as job_err:
+            logger.error("Failed to link document ID to job: %s", job_err)
     
     # 3. Layout-aware Chunking
     # Simple chunking split by paragraph/header blocks
@@ -190,8 +237,8 @@ async def ingest_document_pipeline(
             metadata_json=json.dumps({"filename": filename, "ocr_provider": settings.OCR_PROVIDER})
         )
         db.add(sf_chunk)
-        db.commit()
-        db.refresh(sf_chunk)
+        await db.commit()
+        await db.refresh(sf_chunk)
         
         # Compute Embedding (via local jina-clip-v2 or api gemini-embedding-2 fallback)
         try:
@@ -225,22 +272,27 @@ async def ingest_document_pipeline(
     except Exception as e:
         logger.error("Failed to write to Qdrant: %s", e)
         
+    await update_job(db, job_id, progress=0.7, status="processing")
+
     # 5. Extract KG and write to Neo4j
     graph_data = await extract_graph_entities(extracted_text)
     await write_to_neo4j(graph_data)
     
+    await update_job(db, job_id, progress=1.0, status="completed")
     return doc.id
 
 
 async def ingest_video_pipeline(
     video_bytes: bytes,
     video_name: str,
-    db: Session,
+    db: AsyncSession,
     inference_client: InferenceClient,
     vector_client: VectorClient,
-) -> List[int]:
+    job_id: Optional[Any] = None,
+) -> List[Any]:
     """Ingest MP4 Video/Audio files."""
     logger.info("Starting video ingestion pipeline for: %s", video_name)
+    await update_job(db, job_id, progress=0.1, status="processing")
     
     # 1. Transcribe Audio (Mock split: just send the whole file as audio to transcribe)
     try:
@@ -254,6 +306,7 @@ async def ingest_video_pipeline(
                 {"start": 5.0, "end": 10.0, "text": "mentioning commodity index logs"}
             ]
         }
+    await update_job(db, job_id, progress=0.4, status="processing")
         
     # 2. Keyframe visual summary (Simulate keyframe base64 interpretation via Gemini Flash API)
     # We send a mock frame base64 or description prompt
@@ -269,6 +322,7 @@ async def ingest_video_pipeline(
         visual_summary = response.choices[0].message.content
     except Exception:
         visual_summary = "Visual summary shows financial chart trend with upward slope."
+    await update_job(db, job_id, progress=0.7, status="processing")
         
     # 3. Align transcription and keyframes temporally
     # Store aligned blocks in database
@@ -294,8 +348,8 @@ async def ingest_video_pipeline(
             audio_events="laughter" if "laughter" in text.lower() else None
         )
         db.add(video_seg)
-        db.commit()
-        db.refresh(video_seg)
+        await db.commit()
+        await db.refresh(video_seg)
         segment_ids.append(video_seg.id)
         
         # Embed segment
@@ -307,7 +361,7 @@ async def ingest_video_pipeline(
             
         qdrant_points.append(
             PointStruct(
-                id=100000 + video_seg.id,  # Offset to prevent conflict
+                id=video_seg.id,  # Use UUID directly
                 vector=vector,
                 payload={
                     "video_name": video_name,
@@ -327,4 +381,5 @@ async def ingest_video_pipeline(
     except Exception as e:
         logger.error("Failed to write video segments to Qdrant: %s", e)
         
+    await update_job(db, job_id, progress=1.0, status="completed")
     return segment_ids
