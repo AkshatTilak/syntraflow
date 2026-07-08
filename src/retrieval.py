@@ -8,7 +8,7 @@ import logging
 from typing import Any, List, Dict
 from qdrant_client import QdrantClient
 from common.config.settings import settings
-from projects.syntraflow.src.vectors.client import VectorClient
+from common.clients.qdrant import VectorClient
 
 logger = logging.getLogger("syntraflow.retrieval")
 

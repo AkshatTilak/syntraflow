@@ -9,9 +9,9 @@ from sqlalchemy import text
 
 from common.config.settings import settings
 from common.clients.inference import InferenceClient
-from projects.syntraflow.src.vectors.client import VectorClient
+from common.clients.qdrant import VectorClient
 from projects.syntraflow.src.retrieval import RetrievalEngine
-from projects.syntraflow.src.database.client import get_db
+from common.clients.postgres import get_async_db as get_db
 
 # Initialize FastMCP Server
 mcp = FastMCP("SyntraFlow")

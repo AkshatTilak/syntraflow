@@ -9,8 +9,8 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 
-from projects.syntraflow.src.database.client import get_db
-from projects.syntraflow.src.vectors.client import VectorClient
+from common.clients.postgres import get_async_db as get_db
+from common.clients.qdrant import VectorClient
 from projects.syntraflow.src.ingestion import ingest_document_pipeline, ingest_video_pipeline
 from projects.syntraflow.src.retrieval import RetrievalEngine
 
