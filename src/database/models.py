@@ -1,7 +1,8 @@
 """SQLAlchemy models for SyntraFlow data schemas."""
 
+import uuid
 from datetime import datetime
-from sqlalchemy import Column, DateTime, Float, Integer, String, Text
+from sqlalchemy import Column, DateTime, Float, Integer, String, Text, ForeignKey, Uuid
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -47,3 +48,17 @@ class SyntraFlowVideoSegment(Base):
     emotion_tags = Column(String(255), nullable=True)
     audio_events = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SyntraFlowJob(Base):
+    """Stores status tracking details for SyntraFlow ingestion jobs."""
+
+    __tablename__ = "syntraflow_jobs"
+
+    id = Column(Uuid, primary_key=True, default=uuid.uuid4)
+    document_id = Column(Integer, ForeignKey("syntraflow_documents.id"), nullable=True)
+    status = Column(String(20), nullable=False, default="queued")  # queued, processing, completed, failed
+    progress = Column(Float, default=0.0)
+    error_msg = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
