@@ -339,3 +339,103 @@ async def search_documents(request: Request, req: SearchRequest) -> dict:
     except Exception as e:
         logger.error("Search failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Retrieval query failed: {str(e)}")
+
+
+@router.delete("/documents/{doc_id}")
+async def delete_document(
+    doc_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Cascade delete document and related chunks / graph nodes / vectors."""
+    try:
+        doc_uuid = uuid.UUID(doc_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid document ID format.")
+
+    # 1. Fetch document from PostgreSQL to ensure it exists
+    stmt = select(SyntraFlowDocument).where(SyntraFlowDocument.id == doc_uuid)
+    result = await db.execute(stmt)
+    doc = result.scalars().first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    deleted_counts = {
+        "postgres_chunks": 0,
+        "postgres_video_segments": 0,
+        "postgres_jobs": 0,
+        "qdrant_vectors": 0,
+        "neo4j_nodes": 0,
+        "neo4j_edges": 0,
+    }
+
+    # Count database items for reporting
+    from projects.syntraflow.src.database.models import SyntraFlowChunk, SyntraFlowVideoSegment, SyntraFlowJob
+    
+    chunk_count_stmt = select(SyntraFlowChunk).where(SyntraFlowChunk.document_id == doc_uuid)
+    chunk_result = await db.execute(chunk_count_stmt)
+    deleted_counts["postgres_chunks"] = len(chunk_result.scalars().all())
+
+    video_seg_count_stmt = select(SyntraFlowVideoSegment).where(SyntraFlowVideoSegment.document_id == doc_uuid)
+    video_seg_result = await db.execute(video_seg_count_stmt)
+    deleted_counts["postgres_video_segments"] = len(video_seg_result.scalars().all())
+
+    job_count_stmt = select(SyntraFlowJob).where(SyntraFlowJob.document_id == doc_uuid)
+    job_result = await db.execute(job_count_stmt)
+    deleted_counts["postgres_jobs"] = len(job_result.scalars().all())
+
+    # 2. Delete vectors from Qdrant by document ID filter
+    try:
+        from qdrant_client.http import models
+        vector_client = VectorClient()
+        vector_client.get_client().delete(
+            collection_name="syntraflow_chunks_v1",
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="document_id",
+                            match=models.MatchValue(value=str(doc_uuid)),
+                        )
+                    ]
+                )
+            )
+        )
+        deleted_counts["qdrant_vectors"] = deleted_counts["postgres_chunks"] + deleted_counts["postgres_video_segments"]
+    except Exception as qdrant_err:
+        logger.error("Failed to delete vectors from Qdrant: %s", qdrant_err)
+
+    # 3. Delete graph nodes/edges from Neo4j by document reference
+    try:
+        from common.clients.neo4j import get_neo4j_driver
+        driver = get_neo4j_driver()
+        async with driver.session() as session:
+            # Delete relationships (edges) with document_id matching doc_id
+            edge_res = await session.run(
+                "MATCH ()-[r:SyntraFlow_RELATION {document_id: $doc_id}]->() "
+                "DELETE r",
+                doc_id=str(doc_uuid)
+            )
+            edge_summary = await edge_res.consume()
+            deleted_counts["neo4j_edges"] = edge_summary.counters.relationships_deleted
+
+            # Delete entities (nodes) with document_id matching doc_id
+            node_res = await session.run(
+                "MATCH (e:SyntraFlow_Entity {document_id: $doc_id}) "
+                "DETACH DELETE e",
+                doc_id=str(doc_uuid)
+            )
+            node_summary = await node_res.consume()
+            deleted_counts["neo4j_nodes"] = node_summary.counters.nodes_deleted
+    except Exception as neo4j_err:
+        logger.warning("Failed to delete graph nodes/edges from Neo4j: %s", neo4j_err)
+
+    # 4. Cascade delete the document from PostgreSQL (deletes related chunks/video segments/jobs)
+    await db.delete(doc)
+    await db.commit()
+
+    return {
+        "status": "success",
+        "message": f"Document {doc_id} successfully deleted cascade-wide.",
+        "document_id": doc_id,
+        "deleted_counts": deleted_counts,
+    }

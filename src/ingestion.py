@@ -114,7 +114,7 @@ async def extract_graph_entities(text: str) -> dict:
         return {"entities": [], "relationships": [], "claims": []}
 
 
-async def write_to_neo4j(graph_data: dict) -> None:
+async def write_to_neo4j(graph_data: dict, document_id: Optional[str] = None) -> None:
     """Write extracted entities and relationships to Neo4j database using the shared async client."""
     try:
         from common.clients.neo4j import get_neo4j_driver
@@ -123,15 +123,19 @@ async def write_to_neo4j(graph_data: dict) -> None:
             # 1. Create entities (prefixed with SyntraFlow_)
             for ent in graph_data.get("entities", []):
                 await session.run(
-                    "MERGE (e:SyntraFlow_Entity {name: $name}) ON CREATE SET e.type = $type",
-                    name=ent["name"], type=ent["type"]
+                    "MERGE (e:SyntraFlow_Entity {name: $name}) "
+                    "ON CREATE SET e.type = $type, e.document_id = $doc_id "
+                    "ON MATCH SET e.document_id = $doc_id",
+                    name=ent["name"], type=ent["type"], doc_id=document_id
                 )
             # 2. Create relationships
             for rel in graph_data.get("relationships", []):
                 await session.run(
                     "MATCH (a:SyntraFlow_Entity {name: $source}), (b:SyntraFlow_Entity {name: $target}) "
-                    "MERGE (a)-[r:SyntraFlow_RELATION {type: $relation}]->(b)",
-                    source=rel["source"], target=rel["target"], relation=rel["relation"]
+                    "MERGE (a)-[r:SyntraFlow_RELATION {type: $relation}]->(b) "
+                    "ON CREATE SET r.document_id = $doc_id "
+                    "ON MATCH SET r.document_id = $doc_id",
+                    source=rel["source"], target=rel["target"], relation=rel["relation"], doc_id=document_id
                 )
     except Exception as e:
         logger.warning("Could not write to Neo4j: %s. Proceeding with database and vector writes.", e)
@@ -276,7 +280,7 @@ async def ingest_document_pipeline(
 
     # 5. Extract KG and write to Neo4j
     graph_data = await extract_graph_entities(extracted_text)
-    await write_to_neo4j(graph_data)
+    await write_to_neo4j(graph_data, document_id=str(doc.id))
     
     await update_job(db, job_id, progress=1.0, status="completed")
     return doc.id
