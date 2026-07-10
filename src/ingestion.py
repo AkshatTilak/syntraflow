@@ -29,31 +29,39 @@ async def extract_layout_ocr(
     filename: str,
     client: InferenceClient,
 ) -> dict:
-    """Extract layout structures from document using Baidu OCR or Gemini Flash API."""
-    provider = settings.OCR_PROVIDER.lower()
+    """Extract layout structures from document using the active Model Registry configuration."""
+    from common.models.registry import get_active_model
 
-    if provider == "local":
-        logger.info("Executing local Baidu Unlimited-OCR layout extraction...")
-        # 1. Run local Baidu OCR via inference server
+    model_spec = await get_active_model("ocr")
+    mode = model_spec.mode.lower()
+
+    if mode == "local":
+        logger.info("Executing local %s layout extraction...", model_spec.display_name)
+        # 1. Run local OCR via inference server
         ocr_result = await client.ocr(file_bytes, filename=filename)
-        # ocr_result contains raw text / tables / layout
         
         # 2. Call Gemini Flash to structure layout and convert to schema
+        completion_spec = await get_active_model("completion")
         prompt = (
             "You are a document structuring expert. Convert this raw OCR layout result "
             "into a clean, layout-preserving Markdown text, identifying all sections and tables:\n\n"
             f"{json.dumps(ocr_result)}"
         )
         response = await completion_with_fallback(
-            model="gemini/gemini-3.5-flash",
+            model=completion_spec.model_id,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"} if "json" in filename.lower() else None
         )
         content_text = response.choices[0].message.content
-        return {"text": content_text, "layout": ocr_result.get("layout", {}), "tables": ocr_result.get("tables", [])}
+        return {
+            "text": content_text,
+            "blocks": ocr_result.get("blocks", []),
+            "tables": ocr_result.get("tables", []),
+            "layout": ocr_result.get("layout", {})
+        }
 
     else:
-        logger.info("Executing API Gemini Flash layout-aware extraction...")
+        logger.info("Executing API %s layout-aware extraction...", model_spec.display_name)
         # Encode image to base64
         b64_image = base64.b64encode(file_bytes).decode("utf-8")
         
@@ -78,7 +86,7 @@ async def extract_layout_ocr(
         ]
         
         response = await completion_with_fallback(
-            model="gemini/gemini-3.5-flash",
+            model=model_spec.model_id,
             messages=messages,
         )
         res_text = response.choices[0].message.content
@@ -89,6 +97,180 @@ async def extract_layout_ocr(
             return json.loads(res_text)
         except Exception:
             return {"text": res_text, "layout": {}, "tables": []}
+
+
+def count_tokens(text: str) -> int:
+    """Helper to estimate tokens using tiktoken (if available) or fallback estimation."""
+    try:
+        import tiktoken
+        encoding = tiktoken.get_encoding("cl100k_base")
+        return len(encoding.encode(text))
+    except Exception:
+        return len(text.split()) + len(text) // 10
+
+
+def chunk_document_layout_aware(
+    ocr_result: dict,
+    max_tokens: int = 512,
+    overlap: int = 50,
+    min_tokens: int = 50
+) -> list[dict]:
+    """Split OCR text by logical layout boundaries, preserving header context/metadata."""
+    import re
+    
+    blocks = ocr_result.get("blocks", [])
+    parsed_blocks = []
+    
+    if blocks:
+        for b in blocks:
+            b_type = b.get("type", "paragraph")
+            content = b.get("content", "").strip()
+            if not content:
+                continue
+            header_level = 0
+            if b_type == "header":
+                h_match = re.match(r"^(#+)\s+(.*)", content)
+                if h_match:
+                    header_level = len(h_match.group(1))
+                    content = h_match.group(2)
+                else:
+                    header_level = 2
+            parsed_blocks.append({
+                "type": b_type,
+                "content": content,
+                "header_level": header_level,
+                "bbox": b.get("bbox")
+            })
+    else:
+        text = ocr_result.get("text", "")
+        lines = text.split("\n")
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            h_match = re.match(r"^(#+)\s+(.*)", line)
+            if h_match:
+                parsed_blocks.append({
+                    "type": "header",
+                    "content": h_match.group(2),
+                    "header_level": len(h_match.group(1))
+                })
+            else:
+                parsed_blocks.append({
+                    "type": "paragraph",
+                    "content": line,
+                    "header_level": 0
+                })
+                
+    tables = ocr_result.get("tables", [])
+    if tables and not blocks:
+        for t in tables:
+            title = t.get("title", "Table")
+            headers = t.get("headers", [])
+            rows = t.get("rows", [])
+            tb_lines = [f"### Table: {title}"]
+            if headers:
+                tb_lines.append("| " + " | ".join(headers) + " |")
+                tb_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+            for r in rows:
+                tb_lines.append("| " + " | ".join([str(cell) for cell in r]) + " |")
+            parsed_blocks.append({
+                "type": "table",
+                "content": "\n".join(tb_lines),
+                "header_level": 0
+            })
+
+    current_headers = []
+    chunks = []
+    
+    current_chunk_text = ""
+    current_chunk_blocks = []
+    
+    def get_hierarchy_prefix(headers_list):
+        if not headers_list:
+            return ""
+        path = " > ".join([h[1] for h in headers_list])
+        return f"[{path}]\n"
+        
+    for block in parsed_blocks:
+        b_type = block["type"]
+        content = block["content"]
+        h_level = block["header_level"]
+        
+        if b_type == "header":
+            current_headers = [h for h in current_headers if h[0] < h_level]
+            current_headers.append((h_level, content))
+            
+            if current_chunk_text.strip():
+                prefix = get_hierarchy_prefix(current_headers[:-1])
+                chunk_payload = prefix + current_chunk_text.strip()
+                if count_tokens(chunk_payload) >= min_tokens or not chunks:
+                    chunks.append({
+                        "text": chunk_payload,
+                        "metadata": {
+                            "hierarchy": [h[1] for h in current_headers[:-1]],
+                            "bbox_list": [b.get("bbox") for b in current_chunk_blocks if b.get("bbox")]
+                        }
+                    })
+                current_chunk_text = ""
+                current_chunk_blocks = []
+            
+            current_chunk_text = f"Header: {content}\n"
+            current_chunk_blocks.append(block)
+            
+        else:
+            prefix = get_hierarchy_prefix(current_headers)
+            proposed_text = current_chunk_text + ("\n\n" if current_chunk_text else "") + content
+            proposed_payload = prefix + proposed_text
+            proposed_tokens = count_tokens(proposed_payload)
+            
+            if proposed_tokens <= max_tokens:
+                current_chunk_text = proposed_text
+                current_chunk_blocks.append(block)
+            else:
+                if current_chunk_text.strip():
+                    chunk_payload = prefix + current_chunk_text.strip()
+                    chunks.append({
+                        "text": chunk_payload,
+                        "metadata": {
+                            "hierarchy": [h[1] for h in current_headers],
+                            "bbox_list": [b.get("bbox") for b in current_chunk_blocks if b.get("bbox")]
+                        }
+                    })
+                
+                overlap_text = ""
+                overlap_blocks = []
+                if current_chunk_blocks:
+                    accumulated_tokens = 0
+                    for rev_b in reversed(current_chunk_blocks):
+                        b_tok = count_tokens(rev_b["content"])
+                        if accumulated_tokens + b_tok <= overlap:
+                            overlap_blocks.insert(0, rev_b)
+                            accumulated_tokens += b_tok
+                        else:
+                            break
+                    if overlap_blocks:
+                        overlap_text = "\n\n".join([b["content"] for b in overlap_blocks])
+                
+                if overlap_text:
+                    current_chunk_text = overlap_text + "\n\n" + content
+                    current_chunk_blocks = overlap_blocks + [block]
+                else:
+                    current_chunk_text = content
+                    current_chunk_blocks = [block]
+                    
+    if current_chunk_text.strip():
+        prefix = get_hierarchy_prefix(current_headers)
+        chunk_payload = prefix + current_chunk_text.strip()
+        chunks.append({
+            "text": chunk_payload,
+            "metadata": {
+                "hierarchy": [h[1] for h in current_headers],
+                "bbox_list": [b.get("bbox") for b in current_chunk_blocks if b.get("bbox")]
+            }
+        })
+        
+    return chunks
 
 
 async def extract_graph_entities(text: str) -> dict:
@@ -217,28 +399,25 @@ async def ingest_document_pipeline(
             logger.error("Failed to link document ID to job: %s", job_err)
     
     # 3. Layout-aware Chunking
-    # Simple chunking split by paragraph/header blocks
-    paragraphs = [p.strip() for p in extracted_text.split("\n\n") if p.strip()]
-    chunks = []
-    current_chunk = ""
-    for p in paragraphs:
-        if len(current_chunk) + len(p) < 1000:
-            current_chunk += "\n\n" + p if current_chunk else p
-        else:
-            chunks.append(current_chunk)
-            current_chunk = p
-    if current_chunk:
-        chunks.append(current_chunk)
+    chunks_data = chunk_document_layout_aware(ocr_result)
         
     # 4. Generate Embeddings and write chunks to Postgres and Qdrant
     qdrant_points = []
-    for idx, chunk_text in enumerate(chunks):
+    for idx, chunk_info in enumerate(chunks_data):
+        chunk_text = chunk_info["text"]
+        chunk_meta = chunk_info["metadata"]
+        
         # Save chunk to Postgres
         sf_chunk = SyntraFlowChunk(
             document_id=doc.id,
             chunk_index=idx,
             text=chunk_text,
-            metadata_json=json.dumps({"filename": filename, "ocr_provider": settings.OCR_PROVIDER})
+            metadata_json=json.dumps({
+                "filename": filename,
+                "ocr_provider": settings.OCR_PROVIDER,
+                "hierarchy": chunk_meta["hierarchy"],
+                "bbox_list": chunk_meta["bbox_list"]
+            })
         )
         db.add(sf_chunk)
         await db.commit()
@@ -249,9 +428,17 @@ async def ingest_document_pipeline(
             embeds = await inference_client.embed(texts=[chunk_text])
             vector = embeds[0]
         except Exception:
-            # Fallback to mock embedding vector
             logger.warning("Failed to generate embedding via inference. Mocking embedding...")
-            vector = [0.0] * 768  # Standard size
+            # Query active embedding model dimension dynamically
+            dim = 1024
+            try:
+                from common.models.registry import get_active_model
+                embed_spec = await get_active_model("embedding")
+                if embed_spec.vector_dim:
+                    dim = embed_spec.vector_dim
+            except Exception:
+                pass
+            vector = [0.0] * dim
             
         # Store PointStruct for Qdrant
         qdrant_points.append(
