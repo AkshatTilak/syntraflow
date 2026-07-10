@@ -46,14 +46,29 @@ async def retrieve_documents(query: str, strategy: str = "hybrid", limit: int = 
         query_vector = embeds[0]
     except Exception:
         # Fallback query vector
-        query_vector = [0.0] * 768
+        dim = 1024
+        try:
+            dim = await vector.get_vector_dimension()
+        except Exception:
+            pass
+        query_vector = [0.0] * dim
+
+    # Filter to exclude video segments (match only if start_time is missing)
+    from qdrant_client.http import models
+    doc_filter = models.Filter(
+        must=[
+            models.IsEmptyCondition(
+                is_empty=models.PayloadField(key="start_time")
+            )
+        ]
+    )
 
     if strategy == "vector":
-        hits = await engine.search_vector(query_vector, limit=limit)
+        hits = await engine.search_vector(query_vector, limit=limit, query_filter=doc_filter)
     elif strategy == "graph":
         hits = await engine.search_graph(query, limit=limit)
     else:
-        hits = await engine.search_hybrid(query, query_vector, limit=limit)
+        hits = await engine.search_hybrid(query, query_vector, limit=limit, query_filter=doc_filter)
 
     return json.dumps(hits, indent=2)
 
@@ -75,12 +90,25 @@ async def retrieve_video_segments(query: str, limit: int = 5) -> str:
         embeds = await inference.embed(texts=[query])
         query_vector = embeds[0]
     except Exception:
-        query_vector = [0.0] * 768
+        dim = 1024
+        try:
+            dim = await vector.get_vector_dimension()
+        except Exception:
+            pass
+        query_vector = [0.0] * dim
 
-    hits = await engine.search_vector(query_vector, limit=limit)
-    video_hits = [h for h in hits if h["metadata"].get("start_time") is not None]
-    
-    return json.dumps(video_hits or hits[:limit], indent=2)
+    # Filter to match only video segments (match if start_time is present)
+    from qdrant_client.http import models
+    video_filter = models.Filter(
+        must_not=[
+            models.IsEmptyCondition(
+                is_empty=models.PayloadField(key="start_time")
+            )
+        ]
+    )
+
+    hits = await engine.search_vector(query_vector, limit=limit, query_filter=video_filter)
+    return json.dumps(hits, indent=2)
 
 
 @mcp.tool()
@@ -163,4 +191,13 @@ async def query_graph(cypher_query: str) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "sse":
+        import uvicorn
+        host = "0.0.0.0"
+        port = 8012
+        logger.info("Starting FastMCP server over SSE at http://%s:%d", host, port)
+        app = mcp.sse_app()
+        uvicorn.run(app, host=host, port=port)
+    else:
+        mcp.run()

@@ -19,18 +19,24 @@ class RetrievalEngine:
     def __init__(self, vector_client: VectorClient) -> None:
         self.vector_client = vector_client
 
-    async def search_vector(self, query_vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    async def search_vector(
+        self,
+        query_vector: List[float],
+        limit: int = 5,
+        query_filter: Any = None,
+    ) -> List[Dict[str, Any]]:
         """Perform semantic search on Qdrant vector database."""
         try:
-            results = self.vector_client.search_similarity(
+            results = self.vector_client.get_client().search(
                 collection_name="syntraflow_chunks_v1",
                 query_vector=query_vector,
-                limit=limit
+                limit=limit,
+                query_filter=query_filter,
             )
             hits = []
             for item in results:
                 hits.append({
-                    "id": item.id,
+                    "id": str(item.id),
                     "score": item.score,
                     "text": item.payload.get("text", ""),
                     "metadata": {
@@ -76,9 +82,10 @@ class RetrievalEngine:
         query_vector: List[float],
         limit: int = 5,
         rrf_constant: int = 60,
+        query_filter: Any = None,
     ) -> List[Dict[str, Any]]:
         """Executes Vector and Graph searches, then runs Reciprocal Rank Fusion (RRF)."""
-        vector_results = await self.search_vector(query_vector, limit=limit * 2)
+        vector_results = await self.search_vector(query_vector, limit=limit * 2, query_filter=query_filter)
         graph_results = await self.search_graph(query, limit=limit * 2)
 
         # Apply Reciprocal Rank Fusion (RRF)
