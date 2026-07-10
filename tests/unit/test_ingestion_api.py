@@ -2,7 +2,7 @@
 """
 
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch, mock_open
 
 import pytest
 from fastapi import FastAPI
@@ -57,7 +57,7 @@ async def test_ingest_duplicate_document(client, mock_db) -> None:
     """Test duplication checking on file upload."""
     mock_doc = MagicMock()
     mock_doc.id = uuid.uuid4()
-    mock_doc.filename = "test.txt"
+    mock_doc.filename = "test.pdf"
 
     mock_scalars = MagicMock()
     mock_scalars.first.return_value = mock_doc
@@ -69,7 +69,7 @@ async def test_ingest_duplicate_document(client, mock_db) -> None:
 
     response = client.post(
         "/ingest",
-        files={"file": ("test.txt", b"hello world")}
+        files={"file": ("test.pdf", b"hello world")}
     )
     assert response.status_code == 200
     data = response.json()
@@ -91,13 +91,13 @@ async def test_ingest_new_document(client, mock_db) -> None:
     with patch("projects.syntraflow.api.publish_ingestion_job_to_kafka", return_value=True) as mock_kafka:
         response = client.post(
             "/ingest",
-            files={"file": ("new.txt", b"unique content")}
+            files={"file": ("new.pdf", b"unique content")}
         )
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "queued"
         assert "job_id" in data
-        assert data["filename"] == "new.txt"
+        assert data["filename"] == "new.pdf"
         assert mock_kafka.called
 
 
@@ -115,7 +115,7 @@ async def test_ingest_new_document_kafka_offline_fallback(client, mock_db) -> No
         with patch("projects.syntraflow.src.worker.process_ingestion_job") as mock_local_worker:
             response = client.post(
                 "/ingest",
-                files={"file": ("fallback.txt", b"fallback content")}
+                files={"file": ("fallback.pdf", b"fallback content")}
             )
             assert response.status_code == 200
             data = response.json()
@@ -243,3 +243,54 @@ async def test_delete_document_not_found(client, mock_db) -> None:
     response = client.delete(f"/documents/{doc_id}")
     assert response.status_code == 404
     assert "Document not found" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_file_unsupported_format_upload(client) -> None:
+    """Test that uploading a file with unsupported format is rejected."""
+    response = client.post(
+        "/ingest",
+        files={"file": ("test.xyz", b"hello")}
+    )
+    assert response.status_code == 400
+    assert "Unsupported file format" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_file_oversized_upload(client) -> None:
+    """Test that uploading a file larger than the size limit is rejected."""
+    with patch("projects.syntraflow.api.MAX_DOC_SIZE", 10):
+        response = client.post(
+            "/ingest",
+            files={"file": ("test.pdf", b"a" * 20)}
+        )
+        assert response.status_code == 400
+        assert "File size exceeds limit" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_filepath_unsupported_format(client) -> None:
+    """Test that filepath with unsupported format is rejected."""
+    with patch("os.path.exists", return_value=True), \
+         patch("builtins.open", mock_open(read_data=b"some bytes")):
+        response = client.post(
+            "/ingest",
+            data={"filepath": "C:\\some\\path\\file.xyz"}
+        )
+        assert response.status_code == 400
+        assert "Unsupported file format" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_filepath_oversized(client) -> None:
+    """Test that filepath with size exceeding limit is rejected."""
+    with patch("os.path.exists", return_value=True), \
+         patch("os.path.getsize", return_value=20), \
+         patch("projects.syntraflow.api.MAX_DOC_SIZE", 10):
+        response = client.post(
+            "/ingest",
+            data={"filepath": "C:\\some\\path\\file.pdf"}
+        )
+        assert response.status_code == 400
+        assert "File size exceeds limit" in response.json()["detail"]
+

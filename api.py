@@ -49,6 +49,15 @@ async def syntraflow_status(request: Request) -> dict:
     }
 
 
+# File Size & Format Limits Constraints
+MAX_DOC_SIZE = 100 * 1024 * 1024   # 100 MB
+MAX_VIDEO_SIZE = 500 * 1024 * 1024 # 500 MB
+MAX_AUDIO_SIZE = 200 * 1024 * 1024 # 200 MB
+
+DOC_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".docx", ".pptx"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg"}
+
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "temp_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -101,17 +110,80 @@ async def ingest_file(
 
     # 1. Fetch bytes and filename
     if file:
-        file_bytes = await file.read()
         filename = file.filename
+        _, ext = os.path.splitext(filename.lower())
+
+        if ext in DOC_EXTENSIONS:
+            max_size = MAX_DOC_SIZE
+            category = "Document"
+        elif ext in VIDEO_EXTENSIONS:
+            max_size = MAX_VIDEO_SIZE
+            category = "Video"
+        elif ext in AUDIO_EXTENSIONS:
+            max_size = MAX_AUDIO_SIZE
+            category = "Audio"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unsupported file format: {ext}. Supported formats are: "
+                    f"Documents ({', '.join(sorted(DOC_EXTENSIONS))}), "
+                    f"Videos ({', '.join(sorted(VIDEO_EXTENSIONS))}), "
+                    f"Audio ({', '.join(sorted(AUDIO_EXTENSIONS))})."
+                ),
+            )
+
+        file_size = file.size if file.size is not None else 0
+        if file_size > max_size:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File size exceeds limit for {category} ({max_size / (1024 * 1024):.0f} MB). Uploaded size: {file_size / (1024 * 1024):.2f} MB.",
+            )
+
+        file_bytes = await file.read()
+        if len(file_bytes) > max_size:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File size exceeds limit for {category} ({max_size / (1024 * 1024):.0f} MB). Uploaded size: {len(file_bytes) / (1024 * 1024):.2f} MB.",
+            )
     elif filepath:
         try:
             if not os.path.exists(filepath):
                 raise HTTPException(
                     status_code=400, detail=f"File not found: {filepath}"
                 )
+            filename = os.path.basename(filepath)
+            _, ext = os.path.splitext(filename.lower())
+
+            if ext in DOC_EXTENSIONS:
+                max_size = MAX_DOC_SIZE
+                category = "Document"
+            elif ext in VIDEO_EXTENSIONS:
+                max_size = MAX_VIDEO_SIZE
+                category = "Video"
+            elif ext in AUDIO_EXTENSIONS:
+                max_size = MAX_AUDIO_SIZE
+                category = "Audio"
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Unsupported file format: {ext}. Supported formats are: "
+                        f"Documents ({', '.join(sorted(DOC_EXTENSIONS))}), "
+                        f"Videos ({', '.join(sorted(VIDEO_EXTENSIONS))}), "
+                        f"Audio ({', '.join(sorted(AUDIO_EXTENSIONS))})."
+                    ),
+                )
+
+            file_size = os.path.getsize(filepath)
+            if file_size > max_size:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File size exceeds limit for {category} ({max_size / (1024 * 1024):.0f} MB). Uploaded size: {file_size / (1024 * 1024):.2f} MB.",
+                )
+
             with open(filepath, "rb") as f:
                 file_bytes = f.read()
-            filename = os.path.basename(filepath)
         except HTTPException:
             raise
         except Exception as e:
