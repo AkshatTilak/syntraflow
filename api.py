@@ -58,6 +58,47 @@ DOC_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".docx", ".p
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg"}
 
+import re
+
+ALLOWED_MIME_TYPES = {
+    # Documents
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document", # docx
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation", # pptx
+    # Images
+    "image/png",
+    "image/jpeg",
+    "image/tiff",
+    "image/bmp",
+    "image/gif",
+    # Videos
+    "video/mp4",
+    "video/quicktime", # mov
+    "video/webm",
+    "video/x-matroska", # mkv
+    # Audio
+    "audio/wav",
+    "audio/wave",
+    "audio/x-wav",
+    "audio/mpeg", # mp3
+    "audio/mp3",
+    "audio/flac",
+    "audio/ogg",
+    "audio/x-flac",
+    "application/octet-stream"
+}
+
+
+def sanitize_filename(filename: str) -> str:
+    """Sanitizes filename to prevent path traversal and ensure safe characters."""
+    base = os.path.basename(filename)
+    # Remove path traversal sequences
+    base = base.replace("..", "").replace("/", "").replace("\\", "")
+    # Keep only alphanumeric, dots, dashes, underscores
+    base = re.sub(r"[^\w\.\-_]", "_", base)
+    return base
+
+
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "temp_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -110,7 +151,19 @@ async def ingest_file(
 
     # 1. Fetch bytes and filename
     if file:
-        filename = file.filename
+        content_type = file.content_type
+        if content_type and content_type not in ALLOWED_MIME_TYPES:
+            is_valid_prefix = any(
+                content_type.startswith(prefix)
+                for prefix in ["image/", "video/", "audio/", "application/pdf"]
+            )
+            if not is_valid_prefix:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unauthorized/Unsupported Content-Type header: '{content_type}'"
+                )
+
+        filename = sanitize_filename(file.filename)
         _, ext = os.path.splitext(filename.lower())
 
         if ext in DOC_EXTENSIONS:
@@ -152,7 +205,7 @@ async def ingest_file(
                 raise HTTPException(
                     status_code=400, detail=f"File not found: {filepath}"
                 )
-            filename = os.path.basename(filepath)
+            filename = sanitize_filename(os.path.basename(filepath))
             _, ext = os.path.splitext(filename.lower())
 
             if ext in DOC_EXTENSIONS:
