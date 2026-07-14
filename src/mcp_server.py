@@ -162,13 +162,14 @@ async def query_database(table: str, filters: Dict[str, Any], columns: List[str]
 
 
 @mcp.tool()
-async def query_graph(cypher_query: str) -> str:
+async def query_graph(cypher_query: str, parameters: Optional[Dict[str, Any]] = None) -> str:
     """Execute Cypher query against Neo4j in a safe, read-only parameterized way.
 
     Args:
         cypher_query: Cypher statement. Must start with MATCH or MATCH/RETURN only.
+        parameters: Optional dictionary of parameters for the query.
     """
-    logger.info("MCP Tool [query_graph]: query=%s", cypher_query)
+    logger.info("MCP Tool [query_graph]: query=%s, parameters=%s", cypher_query, parameters)
     
     # Simple query check to prevent write operations (CREATE, MERGE, DELETE, SET)
     query_upper = cypher_query.upper()
@@ -183,11 +184,12 @@ async def query_graph(cypher_query: str) -> str:
 
     try:
         from common.clients.neo4j import execute_read_query
-        records = await execute_read_query(cypher_query)
+        records = await execute_read_query(cypher_query, parameters)
         return json.dumps(records, default=str)
     except Exception as e:
         logger.error("Graph Query error: %s", e)
         return json.dumps({"error": f"Graph query failed: {str(e)}"})
+
 
 
 if __name__ == "__main__":
