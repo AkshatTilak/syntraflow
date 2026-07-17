@@ -30,6 +30,18 @@ async def extract_layout_ocr(
     client: InferenceClient,
 ) -> dict:
     """Extract layout structures from document using the active Model Registry configuration."""
+    from opentelemetry import trace
+    tracer = trace.get_tracer("syntraflow")
+    with tracer.start_as_current_span("syntraflow.ocr") as span:
+        span.set_attribute("filename", filename)
+        return await _extract_layout_ocr_inner(file_bytes, filename, client)
+
+
+async def _extract_layout_ocr_inner(
+    file_bytes: bytes,
+    filename: str,
+    client: InferenceClient,
+) -> dict:
     from common.models.registry import get_active_model
 
     model_spec = await get_active_model("ocr")
