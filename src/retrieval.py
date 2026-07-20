@@ -6,7 +6,6 @@ using Reciprocal Rank Fusion (RRF).
 
 import logging
 from typing import Any, List, Dict
-from qdrant_client import QdrantClient
 from common.config.settings import settings
 from common.clients.qdrant import VectorClient
 
