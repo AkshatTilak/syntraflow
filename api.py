@@ -36,6 +36,11 @@ class SearchRequest(BaseModel):
 class TextIngestRequest(BaseModel):
     text: str
     filename: str
+    chunker_type: Optional[str] = "recursive"
+    chunk_size: Optional[int] = 512
+    chunk_overlap: Optional[int] = 64
+    pre_processors: Optional[list[str]] = None
+    post_processors: Optional[list[str]] = None
 
 
 @router.get("/status")
@@ -400,6 +405,11 @@ async def ingest_raw_text(
                 filename=req.filename,
                 temp_filepath=temp_filepath,
                 is_video_audio=False,
+                chunker_type=req.chunker_type,
+                chunk_size=req.chunk_size or 512,
+                chunk_overlap=req.chunk_overlap or 64,
+                pre_processors=req.pre_processors,
+                post_processors=req.post_processors,
             )
         )
 

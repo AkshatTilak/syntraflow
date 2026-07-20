@@ -28,6 +28,11 @@ async def process_ingestion_job(
     filename: str,
     temp_filepath: str,
     is_video_audio: bool,
+    chunker_type: Optional[str] = None,
+    chunk_size: int = 512,
+    chunk_overlap: int = 64,
+    pre_processors: Optional[list[str]] = None,
+    post_processors: Optional[list[str]] = None,
 ) -> None:
     """Load file bytes from disk, execute the ingestion pipeline, and clean up."""
     logger.info("Starting ingestion processing for Job ID: %s (%s)", job_id, filename)
@@ -65,6 +70,11 @@ async def process_ingestion_job(
                     inference_client=inference_client,
                     vector_client=vector_client,
                     job_id=job_id,
+                    chunker_type=chunker_type,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    pre_processors=pre_processors,
+                    post_processors=post_processors,
                 )
             logger.info("Successfully completed Ingestion Job: %s", job_id)
 
