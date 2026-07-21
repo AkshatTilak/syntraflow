@@ -128,7 +128,14 @@ async def run_ingestion_consumer(app) -> None:
             if msg is None:
                 continue
             if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
+                err_code = msg.error().code()
+                if err_code in (
+                    KafkaError._PARTITION_EOF,
+                    KafkaError._UNKNOWN_TOPIC,
+                    KafkaError._UNKNOWN_PARTITION,
+                    KafkaError.UNKNOWN_TOPIC_OR_PART,
+                ):
+                    await asyncio.sleep(1.0)
                     continue
                 else:
                     logger.error("Kafka consumer error: %s", msg.error())
