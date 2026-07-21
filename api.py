@@ -471,6 +471,139 @@ async def get_job_status(job_id: str, db: AsyncSession = Depends(get_db)) -> dic
     }
 
 
+@router.get("/documents")
+async def list_documents(
+    limit: int = 10, offset: int = 0, db: AsyncSession = Depends(get_db)
+) -> dict:
+    """List paginated ingested documents."""
+    from sqlalchemy import func
+    total_stmt = select(func.count()).select_from(SyntraFlowDocument)
+    total_res = await db.execute(total_stmt)
+    total_count = total_res.scalar() or 0
+
+    stmt = (
+        select(SyntraFlowDocument)
+        .order_by(SyntraFlowDocument.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    docs = result.scalars().all()
+
+    items = []
+    for doc in docs:
+        items.append({
+            "id": str(doc.id),
+            "filename": doc.filename,
+            "file_hash": doc.file_hash,
+            "file_type": doc.filename.split(".")[-1] if "." in doc.filename else "unknown",
+            "created_at": doc.created_at.isoformat() if doc.created_at else None,
+        })
+
+    return {
+        "status": "success",
+        "total_count": total_count,
+        "limit": limit,
+        "offset": offset,
+        "items": items,
+    }
+
+
+@router.get("/jobs")
+async def list_jobs(
+    status: Optional[str] = None,
+    limit: int = 10,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """List paginated ingestion jobs with optional status filter."""
+    from sqlalchemy import func
+    total_query = select(func.count()).select_from(SyntraFlowJob)
+    query = select(SyntraFlowJob)
+
+    if status:
+        total_query = total_query.where(SyntraFlowJob.status == status)
+        query = query.where(SyntraFlowJob.status == status)
+
+    total_res = await db.execute(total_query)
+    total_count = total_res.scalar() or 0
+
+    stmt = query.order_by(SyntraFlowJob.created_at.desc()).offset(offset).limit(limit)
+    result = await db.execute(stmt)
+    jobs = result.scalars().all()
+
+    items = []
+    for job in jobs:
+        items.append({
+            "job_id": str(job.id),
+            "document_id": str(job.document_id) if job.document_id else None,
+            "status": job.status,
+            "progress": job.progress,
+            "error_msg": job.error_msg,
+            "created_at": job.created_at.isoformat() if job.created_at else None,
+            "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+        })
+
+    return {
+        "status": "success",
+        "total_count": total_count,
+        "limit": limit,
+        "offset": offset,
+        "items": items,
+    }
+
+
+@router.get("/documents/{doc_id}/chunks")
+async def get_document_chunks(
+    doc_id: str,
+    limit: int = 20,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Get chunk details for a specific document."""
+    try:
+        doc_uuid = uuid.UUID(doc_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid document ID format.")
+
+    from projects.syntraflow.src.database.models import SyntraFlowChunk
+    from sqlalchemy import func
+
+    total_stmt = select(func.count()).select_from(SyntraFlowChunk).where(SyntraFlowChunk.document_id == doc_uuid)
+    total_res = await db.execute(total_stmt)
+    total_count = total_res.scalar() or 0
+
+    stmt = (
+        select(SyntraFlowChunk)
+        .where(SyntraFlowChunk.document_id == doc_uuid)
+        .order_by(SyntraFlowChunk.chunk_index.asc())
+        .offset(offset)
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    chunks = result.scalars().all()
+
+    items = []
+    for c in chunks:
+        items.append({
+            "id": str(c.id),
+            "document_id": str(c.document_id),
+            "chunk_index": c.chunk_index,
+            "text": c.text,
+            "token_count": c.token_count,
+            "metadata": c.metadata_json,
+        })
+
+    return {
+        "status": "success",
+        "document_id": doc_id,
+        "total_count": total_count,
+        "limit": limit,
+        "offset": offset,
+        "items": items,
+    }
+
+
 @router.post("/search")
 async def search_documents(request: Request, req: SearchRequest) -> dict:
     """Search indexed documents via Vector, Graph, or Hybrid retrieval."""
