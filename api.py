@@ -142,6 +142,13 @@ async def ingest_file(
     request: Request,
     file: UploadFile = File(None),
     filepath: Optional[str] = Form(None),
+    chunk_strategy: Optional[str] = Form(None),
+    chunk_size: Optional[int] = Form(None),
+    chunk_overlap: Optional[int] = Form(None),
+    ocr_cleanup: Optional[bool] = Form(None),
+    lang_filter: Optional[bool] = Form(None),
+    extract_metadata: Optional[bool] = Form(None),
+    generate_summary: Optional[bool] = Form(None),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Trigger document or video ingestion pipeline asynchronously.
@@ -305,13 +312,30 @@ async def ingest_file(
                 status_code=500, detail="Failed to save uploaded file on Gateway."
             )
 
-    # 6. Prepare Job payload
+    # 6. Prepare pre/post processor lists
+    pre_procs = []
+    if ocr_cleanup:
+        pre_procs.append("ocr_cleanup")
+    if lang_filter:
+        pre_procs.append("language_filter")
+
+    post_procs = []
+    if extract_metadata:
+        post_procs.append("metadata_extractor")
+    if generate_summary:
+        post_procs.append("summary_gen")
+
     job_payload = {
         "job_id": str(job.id),
         "file_hash": file_hash,
         "filename": filename,
         "temp_filepath": temp_filepath,
         "is_video_audio": is_video_audio,
+        "chunker_type": chunk_strategy,
+        "chunk_size": chunk_size or 512,
+        "chunk_overlap": chunk_overlap or 64,
+        "pre_processors": pre_procs,
+        "post_processors": post_procs,
     }
 
     # 7. Publish to Kafka or run locally in background task on error
@@ -329,6 +353,11 @@ async def ingest_file(
                 filename=filename,
                 temp_filepath=temp_filepath,
                 is_video_audio=is_video_audio,
+                chunker_type=chunk_strategy,
+                chunk_size=chunk_size or 512,
+                chunk_overlap=chunk_overlap or 64,
+                pre_processors=pre_procs,
+                post_processors=post_procs,
             )
         )
 
