@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     qdrant_api_key: Optional[str] = Field(default=None, alias="QDRANT_API_KEY")
 
     # API Keys
-    openrouter_api_key: str = Field(..., alias="OPENROUTER_API_KEY")
+    openrouter_api_key: Optional[str] = Field(default=None, alias="OPENROUTER_API_KEY")
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
 
     # Spark Configs
