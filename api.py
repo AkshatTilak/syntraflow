@@ -761,38 +761,58 @@ class QueryCollectionRequest(BaseModel):
 @router.post("/collections")
 async def create_collection(payload: CreateCollectionRequest, db: AsyncSession = Depends(get_db)):
     """Create a new dynamic vector collection in Qdrant and SQL catalog."""
-    from projects.syntraflow.src.collections.manager import CollectionManager
-    
-    # CollectionManager uses sync Session; run in sync DB session or helper
-    def _create(sync_db):
-        mgr = CollectionManager(db=sync_db)
-        return mgr.create_collection(
+    import uuid
+    from projects.syntraflow.src.database.models import SyntraFlowCollection
+    from common.clients.qdrant import VectorClient
+    from qdrant_client.http import models as qdrant_models
+    from sqlalchemy import select
+
+    try:
+        stmt = select(SyntraFlowCollection).where(SyntraFlowCollection.name == payload.name)
+        res = await db.execute(stmt)
+        if res.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail=f"Collection with name '{payload.name}' already exists.")
+
+        try:
+            qdrant_client = VectorClient()
+            qdrant = qdrant_client.get_client()
+            qdrant.create_collection(
+                collection_name=payload.name,
+                vectors_config=qdrant_models.VectorParams(
+                    size=payload.vector_dimension or 1024,
+                    distance=qdrant_models.Distance.COSINE,
+                ),
+            )
+            logger.info("Qdrant collection '%s' created successfully.", payload.name)
+        except Exception as e:
+            logger.warning("Failed to create Qdrant collection '%s': %s", payload.name, e)
+
+        col_record = SyntraFlowCollection(
+            id=str(uuid.uuid4()),
             name=payload.name,
             tenant_id=payload.tenant_id or "default",
             embedding_model=payload.embedding_model or "jina-clip-v2",
             vector_dimension=payload.vector_dimension or 1024,
             description=payload.description,
         )
+        db.add(col_record)
+        await db.commit()
+        await db.refresh(col_record)
 
-    try:
-        sync_session = await db.get_bind()
-        from sqlalchemy.orm import Session
-        with Session(sync_session) as sync_db:
-            rec = _create(sync_db)
-            return {
-                "status": "success",
-                "collection": {
-                    "id": str(rec.id),
-                    "name": rec.name,
-                    "tenant_id": rec.tenant_id,
-                    "embedding_model": rec.embedding_model,
-                    "vector_dimension": int(rec.vector_dimension),
-                    "description": rec.description,
-                    "created_at": rec.created_at.isoformat() if rec.created_at else None,
-                }
+        return {
+            "status": "success",
+            "collection": {
+                "id": str(col_record.id),
+                "name": col_record.name,
+                "tenant_id": col_record.tenant_id,
+                "embedding_model": col_record.embedding_model,
+                "vector_dimension": int(col_record.vector_dimension),
+                "description": col_record.description,
+                "created_at": col_record.created_at.isoformat() if col_record.created_at else None,
             }
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Failed to create collection: %s", e)
         raise HTTPException(status_code=500, detail=f"Failed to create collection: {str(e)}")
@@ -801,18 +821,47 @@ async def create_collection(payload: CreateCollectionRequest, db: AsyncSession =
 @router.get("/collections")
 async def list_collections(tenant_id: Optional[str] = None, db: AsyncSession = Depends(get_db)):
     """List registered collections with vector stats."""
-    from projects.syntraflow.src.collections.manager import CollectionManager
-
-    def _list(sync_db):
-        mgr = CollectionManager(db=sync_db)
-        return mgr.list_collections(tenant_id=tenant_id)
+    from projects.syntraflow.src.database.models import SyntraFlowCollection
+    from common.clients.qdrant import VectorClient
+    from sqlalchemy import select
 
     try:
-        sync_session = await db.get_bind()
-        from sqlalchemy.orm import Session
-        with Session(sync_session) as sync_db:
-            items = _list(sync_db)
-            return {"status": "success", "collections": items, "count": len(items)}
+        stmt = select(SyntraFlowCollection)
+        if tenant_id:
+            stmt = stmt.where(SyntraFlowCollection.tenant_id == tenant_id)
+        res = await db.execute(stmt)
+        records = res.scalars().all()
+
+        try:
+            qdrant_client = VectorClient()
+            qdrant = qdrant_client.get_client()
+        except Exception:
+            qdrant = None
+
+        items = []
+        for rec in records:
+            points_count = 0
+            status = "active"
+            if qdrant:
+                try:
+                    info = qdrant.get_collection(rec.name)
+                    points_count = info.points_count or 0
+                except Exception:
+                    status = "unreachable"
+
+            items.append({
+                "id": str(rec.id),
+                "name": rec.name,
+                "tenant_id": rec.tenant_id,
+                "embedding_model": rec.embedding_model,
+                "vector_dimension": int(rec.vector_dimension),
+                "description": rec.description,
+                "points_count": points_count,
+                "status": status,
+                "created_at": rec.created_at.isoformat() if rec.created_at else None,
+            })
+
+        return {"status": "success", "collections": items, "count": len(items)}
     except Exception as e:
         logger.error("Failed to list collections: %s", e)
         raise HTTPException(status_code=500, detail=f"Failed to list collections: {str(e)}")
@@ -821,20 +870,48 @@ async def list_collections(tenant_id: Optional[str] = None, db: AsyncSession = D
 @router.get("/collections/{collection_id}")
 async def get_collection_details(collection_id: str, db: AsyncSession = Depends(get_db)):
     """Get detailed collection info by ID or name."""
-    from projects.syntraflow.src.collections.manager import CollectionManager
-
-    def _get(sync_db):
-        mgr = CollectionManager(db=sync_db)
-        return mgr.get_collection(collection_id=collection_id)
+    from projects.syntraflow.src.database.models import SyntraFlowCollection
+    from common.clients.qdrant import VectorClient
+    from sqlalchemy import select, or_
 
     try:
-        sync_session = await db.get_bind()
-        from sqlalchemy.orm import Session
-        with Session(sync_session) as sync_db:
-            info = _get(sync_db)
-            if not info:
-                raise HTTPException(status_code=404, detail="Collection not found.")
-            return {"status": "success", "collection": info}
+        stmt = select(SyntraFlowCollection).where(
+            or_(SyntraFlowCollection.id == collection_id, SyntraFlowCollection.name == collection_id)
+        )
+        res = await db.execute(stmt)
+        rec = res.scalar_one_or_none()
+
+        if not rec:
+            raise HTTPException(status_code=404, detail="Collection not found.")
+
+        points_count = 0
+        vectors_count = 0
+        status = "active"
+
+        try:
+            qdrant_client = VectorClient()
+            qdrant = qdrant_client.get_client()
+            info = qdrant.get_collection(rec.name)
+            points_count = info.points_count or 0
+            vectors_count = getattr(info, "indexed_vectors_count", points_count) or points_count
+        except Exception:
+            status = "unreachable"
+
+        return {
+            "status": "success",
+            "collection": {
+                "id": str(rec.id),
+                "name": rec.name,
+                "tenant_id": rec.tenant_id,
+                "embedding_model": rec.embedding_model,
+                "vector_dimension": int(rec.vector_dimension),
+                "description": rec.description,
+                "points_count": points_count,
+                "vectors_count": vectors_count,
+                "status": status,
+                "created_at": rec.created_at.isoformat() if rec.created_at else None,
+            }
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -845,20 +922,34 @@ async def get_collection_details(collection_id: str, db: AsyncSession = Depends(
 @router.delete("/collections/{collection_id}")
 async def delete_collection(collection_id: str, db: AsyncSession = Depends(get_db)):
     """Delete vector collection from Qdrant and SQL catalog."""
-    from projects.syntraflow.src.collections.manager import CollectionManager
-
-    def _delete(sync_db):
-        mgr = CollectionManager(db=sync_db)
-        return mgr.delete_collection(collection_id=collection_id)
+    from projects.syntraflow.src.database.models import SyntraFlowCollection
+    from common.clients.qdrant import VectorClient
+    from sqlalchemy import select, or_
 
     try:
-        sync_session = await db.get_bind()
-        from sqlalchemy.orm import Session
-        with Session(sync_session) as sync_db:
-            deleted = _delete(sync_db)
-            if not deleted:
-                raise HTTPException(status_code=404, detail="Collection not found.")
-            return {"status": "success", "message": f"Collection '{collection_id}' successfully deleted."}
+        stmt = select(SyntraFlowCollection).where(
+            or_(SyntraFlowCollection.id == collection_id, SyntraFlowCollection.name == collection_id)
+        )
+        res = await db.execute(stmt)
+        rec = res.scalar_one_or_none()
+
+        if not rec:
+            raise HTTPException(status_code=404, detail="Collection not found.")
+
+        col_name = rec.name
+
+        try:
+            qdrant_client = VectorClient()
+            qdrant = qdrant_client.get_client()
+            qdrant.delete_collection(collection_name=col_name)
+            logger.info("Qdrant collection '%s' deleted successfully.", col_name)
+        except Exception as e:
+            logger.warning("Failed to delete Qdrant collection '%s': %s", col_name, e)
+
+        await db.delete(rec)
+        await db.commit()
+
+        return {"status": "success", "message": f"Collection '{col_name}' successfully deleted."}
     except HTTPException:
         raise
     except Exception as e:

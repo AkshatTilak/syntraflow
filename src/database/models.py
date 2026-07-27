@@ -90,7 +90,7 @@ class SyntraFlowCollection(Base):
 
     __tablename__ = "syntraflow_collections"
 
-    id = Column(Uuid, primary_key=True, default=uuid.uuid4)
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String(255), unique=True, nullable=False, index=True)
     tenant_id = Column(String(255), nullable=False, default="default")
     embedding_model = Column(String(255), nullable=False, default="jina-clip-v2")
