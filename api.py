@@ -736,3 +736,160 @@ async def delete_document(
         "document_id": doc_id,
         "deleted_counts": deleted_counts,
     }
+
+
+# ==========================================
+# Collection Management & Pluggable Query Endpoints
+# ==========================================
+
+class CreateCollectionRequest(BaseModel):
+    name: str
+    tenant_id: Optional[str] = "default"
+    embedding_model: Optional[str] = "jina-clip-v2"
+    vector_dimension: Optional[int] = 1024
+    description: Optional[str] = None
+
+
+class QueryCollectionRequest(BaseModel):
+    query: str
+    collection_name: Optional[str] = "syntraflow_chunks_v1"
+    strategy: Optional[str] = "dense"
+    limit: Optional[int] = 5
+    filters: Optional[Dict[str, Any]] = None
+
+
+@router.post("/collections")
+async def create_collection(payload: CreateCollectionRequest, db: AsyncSession = Depends(get_db)):
+    """Create a new dynamic vector collection in Qdrant and SQL catalog."""
+    from projects.syntraflow.src.collections.manager import CollectionManager
+    
+    # CollectionManager uses sync Session; run in sync DB session or helper
+    def _create(sync_db):
+        mgr = CollectionManager(db=sync_db)
+        return mgr.create_collection(
+            name=payload.name,
+            tenant_id=payload.tenant_id or "default",
+            embedding_model=payload.embedding_model or "jina-clip-v2",
+            vector_dimension=payload.vector_dimension or 1024,
+            description=payload.description,
+        )
+
+    try:
+        sync_session = await db.get_bind()
+        from sqlalchemy.orm import Session
+        with Session(sync_session) as sync_db:
+            rec = _create(sync_db)
+            return {
+                "status": "success",
+                "collection": {
+                    "id": str(rec.id),
+                    "name": rec.name,
+                    "tenant_id": rec.tenant_id,
+                    "embedding_model": rec.embedding_model,
+                    "vector_dimension": int(rec.vector_dimension),
+                    "description": rec.description,
+                    "created_at": rec.created_at.isoformat() if rec.created_at else None,
+                }
+            }
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error("Failed to create collection: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to create collection: {str(e)}")
+
+
+@router.get("/collections")
+async def list_collections(tenant_id: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+    """List registered collections with vector stats."""
+    from projects.syntraflow.src.collections.manager import CollectionManager
+
+    def _list(sync_db):
+        mgr = CollectionManager(db=sync_db)
+        return mgr.list_collections(tenant_id=tenant_id)
+
+    try:
+        sync_session = await db.get_bind()
+        from sqlalchemy.orm import Session
+        with Session(sync_session) as sync_db:
+            items = _list(sync_db)
+            return {"status": "success", "collections": items, "count": len(items)}
+    except Exception as e:
+        logger.error("Failed to list collections: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to list collections: {str(e)}")
+
+
+@router.get("/collections/{collection_id}")
+async def get_collection_details(collection_id: str, db: AsyncSession = Depends(get_db)):
+    """Get detailed collection info by ID or name."""
+    from projects.syntraflow.src.collections.manager import CollectionManager
+
+    def _get(sync_db):
+        mgr = CollectionManager(db=sync_db)
+        return mgr.get_collection(collection_id=collection_id)
+
+    try:
+        sync_session = await db.get_bind()
+        from sqlalchemy.orm import Session
+        with Session(sync_session) as sync_db:
+            info = _get(sync_db)
+            if not info:
+                raise HTTPException(status_code=404, detail="Collection not found.")
+            return {"status": "success", "collection": info}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to get collection details: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to get collection: {str(e)}")
+
+
+@router.delete("/collections/{collection_id}")
+async def delete_collection(collection_id: str, db: AsyncSession = Depends(get_db)):
+    """Delete vector collection from Qdrant and SQL catalog."""
+    from projects.syntraflow.src.collections.manager import CollectionManager
+
+    def _delete(sync_db):
+        mgr = CollectionManager(db=sync_db)
+        return mgr.delete_collection(collection_id=collection_id)
+
+    try:
+        sync_session = await db.get_bind()
+        from sqlalchemy.orm import Session
+        with Session(sync_session) as sync_db:
+            deleted = _delete(sync_db)
+            if not deleted:
+                raise HTTPException(status_code=404, detail="Collection not found.")
+            return {"status": "success", "message": f"Collection '{collection_id}' successfully deleted."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to delete collection: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to delete collection: {str(e)}")
+
+
+@router.post("/query")
+async def query_retrieval_engine(payload: QueryCollectionRequest):
+    """Execute search query using pluggable strategy (dense, sparse, hybrid, graph)."""
+    try:
+        vector_client = VectorClient()
+        from projects.syntraflow.src.retrieval.engine import RetrievalEngine as ModularEngine
+
+        engine = ModularEngine(vector_client=vector_client)
+        hits = await engine.query(
+            query=payload.query,
+            collection_name=payload.collection_name or "syntraflow_chunks_v1",
+            strategy=payload.strategy or "dense",
+            limit=payload.limit or 5,
+            filters=payload.filters,
+        )
+        return {
+            "status": "success",
+            "query": payload.query,
+            "strategy": payload.strategy,
+            "collection_name": payload.collection_name,
+            "count": len(hits),
+            "results": hits,
+        }
+    except Exception as e:
+        logger.error("Query execution failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Query execution failed: {str(e)}")
+
