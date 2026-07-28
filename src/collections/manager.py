@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from qdrant_client.http import models as qdrant_models
 
 from common.clients.qdrant import VectorClient
-from projects.syntraflow.src.database.models import SyntraFlowCollection
+from projects.syntraflow.src.database.models import SyntraFlowCollection, build_physical_name
 
 logger = logging.getLogger("syntraflow.collections.manager")
 
@@ -39,7 +39,8 @@ class CollectionManager:
     def create_collection(
         self,
         name: str,
-        tenant_id: str = "default",
+        hub_id: str,
+        hub_slug: str = "default",
         embedding_model: str = "jina-clip-v2",
         vector_dimension: int = 1024,
         description: Optional[str] = None,
@@ -47,8 +48,9 @@ class CollectionManager:
         """Create a new dynamic vector collection in Qdrant and store metadata in SQL.
 
         Args:
-            name: Unique name for the vector collection.
-            tenant_id: Target tenant identifier.
+            name: Name for the vector collection (unique within hub).
+            hub_id: Parent hub UUID string.
+            hub_slug: Parent hub slug string.
             embedding_model: Associated embedding model name.
             vector_dimension: Vector dimension size (e.g. 1024).
             description: Optional textual description.
@@ -56,31 +58,34 @@ class CollectionManager:
         Returns:
             Created SyntraFlowCollection SQL model instance.
         """
+        physical_name = build_physical_name(hub_slug, name)
+
         # Check for existing record in DB
-        existing = self.db.query(SyntraFlowCollection).filter_by(name=name).first()
+        existing = self.db.query(SyntraFlowCollection).filter_by(hub_id=hub_id, name=name).first()
         if existing:
-            raise ValueError(f"Collection with name '{name}' already exists.")
+            raise ValueError(f"Collection with name '{name}' already exists in this hub.")
 
         # Initialize Qdrant collection if client is available
         if self.vector_client:
             try:
                 qdrant = self.vector_client.get_client()
                 qdrant.create_collection(
-                    collection_name=name,
+                    collection_name=physical_name,
                     vectors_config=qdrant_models.VectorParams(
                         size=vector_dimension,
                         distance=qdrant_models.Distance.COSINE,
                     ),
                 )
-                logger.info("Qdrant collection '%s' created successfully.", name)
+                logger.info("Qdrant collection '%s' created successfully.", physical_name)
             except Exception as e:
-                logger.error("Failed to create Qdrant collection '%s': %s", name, e)
+                logger.error("Failed to create Qdrant collection '%s': %s", physical_name, e)
 
         # Create SQL model record
         col_record = SyntraFlowCollection(
-            id=uuid.uuid4(),
+            id=str(uuid.uuid4()),
+            hub_id=hub_id,
             name=name,
-            tenant_id=tenant_id,
+            physical_name=physical_name,
             embedding_model=embedding_model,
             vector_dimension=vector_dimension,
             description=description,
@@ -90,18 +95,18 @@ class CollectionManager:
         self.db.refresh(col_record)
         return col_record
 
-    def list_collections(self, tenant_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_collections(self, hub_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """List vector collections with SQL metadata and Qdrant stats.
 
         Args:
-            tenant_id: Optional tenant filter.
+            hub_id: Optional hub filter.
 
         Returns:
             List of dictionaries containing collection metadata and counts.
         """
         query = self.db.query(SyntraFlowCollection)
-        if tenant_id:
-            query = query.filter_by(tenant_id=tenant_id)
+        if hub_id:
+            query = query.filter_by(hub_id=hub_id)
         records = query.all()
 
         results = []
@@ -113,15 +118,16 @@ class CollectionManager:
 
             if qdrant:
                 try:
-                    info = qdrant.get_collection(rec.name)
+                    info = qdrant.get_collection(rec.physical_name)
                     points_count = info.points_count or 0
                 except Exception:
                     status = "unreachable"
 
             results.append({
                 "id": str(rec.id),
+                "hub_id": rec.hub_id,
                 "name": rec.name,
-                "tenant_id": rec.tenant_id,
+                "physical_name": rec.physical_name,
                 "embedding_model": rec.embedding_model,
                 "vector_dimension": int(rec.vector_dimension),
                 "description": rec.description,

@@ -7,14 +7,21 @@ Alembic migration support across the monorepo.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Index, String, Text, Uuid
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Index, String, Text, UniqueConstraint, Uuid
 from sqlalchemy.orm import relationship
 
-from common.models.database import Base
+from common.models.database import Base, HubScopedMixin
 
 
-class SyntraFlowDocument(Base):
-    """Stores document metadata and layout-preserving Markdown content."""
+def build_physical_name(hub_slug: str, name: str) -> str:
+    """Build canonical global Qdrant physical collection name from hub_slug and collection name."""
+    return f"{hub_slug}__{name}"
+
+
+class SyntraFlowDocument(HubScopedMixin, Base):
+    """Stores document metadata and layout-preserving Markdown content.
+    Hub-scoped: every query MUST filter by hub_id. Note: hub_id is authoritative for scoping.
+    """
 
     __tablename__ = "syntraflow_documents"
 
@@ -31,8 +38,10 @@ class SyntraFlowDocument(Base):
     jobs = relationship("SyntraFlowJob", back_populates="document", cascade="all, delete-orphan")
 
 
-class SyntraFlowChunk(Base):
-    """Stores individual text/markdown chunks, image references, and structural JSON."""
+class SyntraFlowChunk(HubScopedMixin, Base):
+    """Stores individual text/markdown chunks, image references, and structural JSON.
+    Hub-scoped: every query MUST filter by hub_id. Denormalised from parent document for performance.
+    """
 
     __tablename__ = "syntraflow_chunks"
 
@@ -48,8 +57,10 @@ class SyntraFlowChunk(Base):
     document = relationship("SyntraFlowDocument", back_populates="chunks")
 
 
-class SyntraFlowVideoSegment(Base):
-    """Stores timestamped transcribed video segments, visual descriptions, and audio tags."""
+class SyntraFlowVideoSegment(HubScopedMixin, Base):
+    """Stores timestamped transcribed video segments, visual descriptions, and audio tags.
+    Hub-scoped: every query MUST filter by hub_id. Denormalised from parent document for performance.
+    """
 
     __tablename__ = "syntraflow_video_segments"
 
@@ -68,8 +79,10 @@ class SyntraFlowVideoSegment(Base):
     document = relationship("SyntraFlowDocument", back_populates="video_segments")
 
 
-class SyntraFlowJob(Base):
-    """Stores status tracking details for SyntraFlow ingestion jobs."""
+class SyntraFlowJob(HubScopedMixin, Base):
+    """Stores status tracking details for SyntraFlow ingestion jobs.
+    Hub-scoped: every query MUST filter by hub_id. Denormalised from parent document for performance.
+    """
 
     __tablename__ = "syntraflow_jobs"
 
@@ -85,16 +98,22 @@ class SyntraFlowJob(Base):
     document = relationship("SyntraFlowDocument", back_populates="jobs")
 
 
-class SyntraFlowCollection(Base):
-    """Stores metadata for dynamic Qdrant vector collections."""
+class SyntraFlowCollection(HubScopedMixin, Base):
+    """Stores metadata for dynamic Qdrant vector collections.
+    Hub-scoped: every query MUST filter by hub_id (hubs.md §5.3).
+    """
 
     __tablename__ = "syntraflow_collections"
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    name = Column(String(255), unique=True, nullable=False, index=True)
-    tenant_id = Column(String(255), nullable=False, default="default")
+    name = Column(String(255), nullable=False, index=True)
+    physical_name = Column(String(300), nullable=False, index=True)  # "{hub_slug}__{name}", globally unique
     embedding_model = Column(String(255), nullable=False, default="jina-clip-v2")
     vector_dimension = Column(Float, nullable=False, default=1024)
     description = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    __table_args__ = (
+        UniqueConstraint("hub_id", "name", name="uq_syntraflow_collections_hub_name"),
+        UniqueConstraint("physical_name", name="uq_syntraflow_collections_physical_name"),
+    )
