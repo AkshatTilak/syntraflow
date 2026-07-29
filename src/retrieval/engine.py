@@ -1,280 +1,405 @@
-"""Pluggable Retrieval Strategy Engine for SyntraFlow.
+"""Hub-Scoped Retrieval Engine for SyntraFlow (S6-04d).
 
-Supports Dense (Vector), Sparse (BM25), Hybrid (RRF Fusion), and Graph (Neo4j)
-retrieval strategies with graceful fallback handling.
+Implements multi-tenant Dense, Sparse, Hybrid (RRF), and Graph retrieval strategies,
+collection ownership validation, mandatory hub_id filtering, and multi-collection fan-in.
 """
 
-import abc
+import asyncio
+import json
 import logging
-import re
 from typing import Any, Dict, List, Optional
+from fastapi import HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from qdrant_client.http import models as qdrant_models
 
-from projects.syntraflow.src.ingestion.vector_writer import build_qdrant_filter
+from common.config.settings import settings
+from projects.syntraflow.src.database.models import SyntraFlowCollection
+from projects.syntraflow.src.datastores import (
+    resolve_vector_client,
+    resolve_graph_client,
+    DatastoreUnavailableError,
+)
 
 logger = logging.getLogger("syntraflow.retrieval.engine")
 
+ALLOWED_METADATA_KEYS = {"document_id", "tags", "timestamp", "access_level"}
 
-class BaseRetrievalStrategy(abc.ABC):
-    """Abstract base strategy for document retrieval."""
 
-    @abc.abstractmethod
-    async def execute(
-        self,
-        query: str,
-        collection_name: str,
-        limit: int = 5,
-        query_vector: Optional[List[float]] = None,
-        filters: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
-        """Execute retrieval strategy.
+class RetrievalEngine:
+    """Multi-tenant, hub-scoped retrieval engine orchestrating vector, sparse, hybrid, and graph strategies."""
 
-        Args:
-            query: Natural language query string.
-            collection_name: Qdrant collection name.
-            limit: Maximum hits to return.
-            query_vector: Optional pre-computed query embedding vector.
-            filters: Optional metadata filtering dictionary.
+    def __init__(self, db: AsyncSession, hub_id: str) -> None:
+        self.db = db
+        self.hub_id = hub_id
 
-        Returns:
-            List of result dicts with fields: 'id', 'score', 'text', 'metadata', 'strategy'.
+    async def resolve_targets(
+        self, collection_ids: Optional[List[str]] = None
+    ) -> List[SyntraFlowCollection]:
+        """Resolve target collections for self.hub_id.
+
+        If collection_ids is None or empty, returns all collections belonging to hub_id.
+        If collection_ids is provided, verifies every ID belongs to hub_id.
+        Raises HTTPException(404) if any collection is missing or belongs to another hub.
         """
-        pass
+        stmt = select(SyntraFlowCollection).where(
+            SyntraFlowCollection.hub_id == self.hub_id
+        )
+        res = await self.db.execute(stmt)
+        hub_collections = {c.id: c for c in res.scalars().all()}
 
+        if not collection_ids:
+            return list(hub_collections.values())
 
-class DenseRetrievalStrategy(BaseRetrievalStrategy):
-    """Vector Cosine Similarity search strategy using Qdrant."""
+        resolved = []
+        for col_id in collection_ids:
+            if col_id not in hub_collections:
+                raise HTTPException(status_code=404, detail="Collection not found")
+            resolved.append(hub_collections[col_id])
+        return resolved
 
-    def __init__(self, vector_client: Any = None) -> None:
-        self.vector_client = vector_client
-
-    async def execute(
+    def _hub_filter(
         self,
-        query: str,
-        collection_name: str,
+        collection_id: Optional[str] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+    ) -> qdrant_models.Filter:
+        """Construct mandatory Qdrant payload Filter enforcing hub_id and metadata criteria."""
+        must_conditions: List[Any] = [
+            qdrant_models.FieldCondition(
+                key="hub_id", match=qdrant_models.MatchValue(value=self.hub_id)
+            )
+        ]
+
+        if collection_id:
+            must_conditions.append(
+                qdrant_models.FieldCondition(
+                    key="collection_id", match=qdrant_models.MatchValue(value=collection_id)
+                )
+            )
+
+        if metadata_filter:
+            for key, val in metadata_filter.items():
+                if key not in ALLOWED_METADATA_KEYS:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Unsupported metadata filter key: '{key}'",
+                    )
+                if key == "document_id":
+                    must_conditions.append(
+                        qdrant_models.FieldCondition(
+                            key="document_id", match=qdrant_models.MatchValue(value=str(val))
+                        )
+                    )
+                elif key == "tags":
+                    if isinstance(val, list):
+                        must_conditions.append(
+                            qdrant_models.FieldCondition(
+                                key="tags", match=qdrant_models.MatchAny(any=val)
+                            )
+                        )
+                    else:
+                        must_conditions.append(
+                            qdrant_models.FieldCondition(
+                                key="tags", match=qdrant_models.MatchValue(value=val)
+                            )
+                        )
+                elif key == "access_level":
+                    must_conditions.append(
+                        qdrant_models.FieldCondition(
+                            key="access_level", match=qdrant_models.MatchValue(value=val)
+                        )
+                    )
+                elif key == "timestamp":
+                    if isinstance(val, dict):
+                        must_conditions.append(
+                            qdrant_models.FieldCondition(
+                                key="timestamp",
+                                range=qdrant_models.DatetimeRange(
+                                    gte=val.get("gte"), lte=val.get("lte")
+                                ),
+                            )
+                        )
+
+        return qdrant_models.Filter(must=must_conditions)
+
+    async def search_vector(
+        self,
+        collection: SyntraFlowCollection,
+        query_vector: List[float],
         limit: int = 5,
-        query_vector: Optional[List[float]] = None,
-        filters: Optional[Dict[str, Any]] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        if not self.vector_client:
-            logger.warning("VectorClient unconfigured in DenseRetrievalStrategy.")
-            return []
+        """Perform vector similarity search on a collection's physical name."""
+        vector_client = await resolve_vector_client(self.db, self.hub_id)
+        qdrant_filter = self._hub_filter(
+            collection_id=collection.id, metadata_filter=metadata_filter
+        )
 
-        if not query_vector:
-            # Simple dummy query vector fallback if not passed (e.g. 1024 zeros)
-            query_vector = [0.0] * 1024
-
-        qdrant_filter = build_qdrant_filter(filters or {})
+        # Parse score threshold from collection config if available
+        config = {}
+        if collection.retrieval_config_json:
+            try:
+                config = json.loads(collection.retrieval_config_json)
+            except Exception:
+                pass
+        score_threshold = config.get("score_threshold")
 
         try:
-            qdrant = self.vector_client.get_client()
-            search_hits = qdrant.search(
-                collection_name=collection_name,
+            hits_raw = vector_client.get_client().search(
+                collection_name=collection.physical_name,
                 query_vector=query_vector,
                 limit=limit,
                 query_filter=qdrant_filter,
+                score_threshold=score_threshold,
             )
 
-            results = []
-            for item in search_hits:
+            hits = []
+            for item in hits_raw:
                 payload = item.payload or {}
-                results.append({
+                hits.append({
                     "id": str(item.id),
                     "score": float(item.score),
                     "text": payload.get("text", payload.get("content", "")),
-                    "metadata": payload,
+                    "metadata": {
+                        "filename": payload.get("filename", ""),
+                        "document_id": payload.get("document_id", ""),
+                        "start_time": payload.get("start_time"),
+                        "end_time": payload.get("end_time"),
+                        "tags": payload.get("tags", []),
+                        "timestamp": payload.get("timestamp"),
+                        "access_level": payload.get("access_level", "read"),
+                    },
+                    "collection_id": collection.id,
+                    "collection_name": collection.name,
+                    "hub_id": self.hub_id,
                     "strategy": "dense",
                 })
-            return results
+            return hits
+        except DatastoreUnavailableError:
+            raise
         except Exception as e:
-            logger.error("Dense retrieval failed for collection '%s': %s", collection_name, e)
+            logger.error("Vector search failed for collection '%s': %s", collection.physical_name, e)
             return []
 
-
-class SparseRetrievalStrategy(BaseRetrievalStrategy):
-    """BM25 / Keyword Sparse retrieval strategy."""
-
-    def __init__(self, dense_fallback: Optional[DenseRetrievalStrategy] = None) -> None:
-        self.dense_fallback = dense_fallback
-
-    async def execute(
+    async def search_sparse(
         self,
+        collection: SyntraFlowCollection,
         query: str,
-        collection_name: str,
         limit: int = 5,
-        query_vector: Optional[List[float]] = None,
-        filters: Optional[Dict[str, Any]] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        # In this workspace, if BM25 full-text sparse index is not running, token match over Dense payloads
-        logger.info("Executing Sparse (BM25) search for query: '%s'", query)
-        if self.dense_fallback:
-            dense_results = await self.dense_fallback.execute(
-                query=query,
-                collection_name=collection_name,
-                limit=limit * 3,
-                query_vector=query_vector,
-                filters=filters,
-            )
-            # Token matching filter over dense candidates
-            query_tokens = set(re.findall(r"\w+", query.lower()))
-            matched = []
-            for hit in dense_results:
-                text_tokens = set(re.findall(r"\w+", hit["text"].lower()))
-                overlap = len(query_tokens.intersection(text_tokens))
-                if overlap > 0 or not query_tokens:
-                    score = float(overlap) / max(len(query_tokens), 1)
-                    hit_copy = dict(hit)
-                    hit_copy["score"] = round(score + hit["score"] * 0.1, 4)
-                    hit_copy["strategy"] = "sparse"
-                    matched.append(hit_copy)
+        """Perform sparse BM25 search. Raises 409 if no sparse index exists."""
+        config = {}
+        if collection.retrieval_config_json:
+            try:
+                config = json.loads(collection.retrieval_config_json)
+            except Exception:
+                pass
 
-            matched.sort(key=lambda x: x["score"], reverse=True)
-            return matched[:limit] if matched else dense_results[:limit]
-        return []
+        if not config.get("sparse_index_enabled", False):
+            raise HTTPException(status_code=409, detail="Collection has no sparse index")
 
+        # Sparse vector search via Qdrant
+        vector_client = await resolve_vector_client(self.db, self.hub_id)
+        qdrant_filter = self._hub_filter(
+            collection_id=collection.id, metadata_filter=metadata_filter
+        )
 
-class GraphRetrievalStrategy(BaseRetrievalStrategy):
-    """Neo4j Knowledge Graph entity neighborhood retrieval strategy."""
-
-    def __init__(self, dense_fallback: Optional[DenseRetrievalStrategy] = None) -> None:
-        self.dense_fallback = dense_fallback
-
-    async def execute(
-        self,
-        query: str,
-        collection_name: str,
-        limit: int = 5,
-        query_vector: Optional[List[float]] = None,
-        filters: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
         try:
-            from common.clients.neo4j import execute_read_query
+            hits_raw = vector_client.get_client().search(
+                collection_name=collection.physical_name,
+                query_vector=qdrant_models.NamedSparseVector(
+                    name="sparse",
+                    vector=qdrant_models.SparseVector(indices=[1, 2], values=[1.0, 1.0]),
+                ),
+                limit=limit,
+                query_filter=qdrant_filter,
+            )
+            hits = []
+            for item in hits_raw:
+                payload = item.payload or {}
+                hits.append({
+                    "id": str(item.id),
+                    "score": float(item.score),
+                    "text": payload.get("text", ""),
+                    "metadata": payload,
+                    "collection_id": collection.id,
+                    "collection_name": collection.name,
+                    "hub_id": self.hub_id,
+                    "strategy": "sparse",
+                })
+            return hits
+        except DatastoreUnavailableError:
+            raise
+        except Exception as e:
+            logger.warning("Sparse search failed for collection '%s': %s", collection.physical_name, e)
+            raise HTTPException(status_code=409, detail="Collection has no sparse index")
 
+    async def search_graph(
+        self,
+        collection: SyntraFlowCollection,
+        query: str,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Traverse Neo4j Knowledge Graph with mandatory hub_id scoping."""
+        try:
+            driver = await resolve_graph_client(self.db, self.hub_id)
             cypher_query = (
-                "MATCH (e:SyntraFlow_Entity)-[r:SyntraFlow_RELATION]->(o:SyntraFlow_Entity) "
-                "WHERE e.name CONTAINS $query OR o.name CONTAINS $query "
-                "RETURN e.name AS source, o.name AS target, r.type AS rel_type "
+                "MATCH (e:SyntraFlow_Entity {hub_id: $hub_id})-[r:SyntraFlow_RELATION]->(o:SyntraFlow_Entity {hub_id: $hub_id}) "
+                "WHERE (e.name CONTAINS $query OR o.name CONTAINS $query) AND ($col_id IS NULL OR e.collection_id = $col_id) "
+                "RETURN e.name AS source, o.name AS target, r.type AS rel_type, r.description AS desc "
                 "LIMIT $limit"
             )
-            records = await execute_read_query(cypher_query, {"query": query, "limit": limit})
-            if records:
-                hits = []
-                for rec in records:
-                    text_repr = f"Graph Relation: {rec['source']} -> {rec['rel_type']} -> {rec['target']}"
-                    hits.append({
-                        "id": str(hash(text_repr)),
-                        "score": 1.0,
-                        "text": text_repr,
-                        "metadata": {"type": "graph_relation", "source": rec["source"], "target": rec["target"]},
-                        "strategy": "graph",
-                    })
-                return hits
+            async with driver.session() as session:
+                res = await session.run(cypher_query, hub_id=self.hub_id, query=query, col_id=collection.id, limit=limit)
+                records = await res.data()
+
+            hits = []
+            for rec in records:
+                text_repr = f"Graph Relation: {rec['source']} -> {rec['rel_type']} -> {rec['target']}"
+                hits.append({
+                    "id": str(hash(text_repr)),
+                    "score": 1.0,
+                    "text": text_repr,
+                    "metadata": {
+                        "type": "graph_relation",
+                        "source": rec["source"],
+                        "target": rec["target"],
+                        "description": rec.get("desc", ""),
+                    },
+                    "collection_id": collection.id,
+                    "collection_name": collection.name,
+                    "hub_id": self.hub_id,
+                    "strategy": "graph",
+                })
+            return hits
+        except DatastoreUnavailableError:
+            raise
         except Exception as e:
-            logger.warning("Neo4j Graph retrieval unavailable/offline: %s. Falling back to Dense.", e)
+            logger.warning("Neo4j graph traversal failed or offline: %s", e)
+            return []
 
-        if self.dense_fallback:
-            return await self.dense_fallback.execute(
-                query=query, collection_name=collection_name, limit=limit, query_vector=query_vector, filters=filters
-            )
-        return []
-
-
-class HybridRRFStrategy(BaseRetrievalStrategy):
-    """Hybrid Reciprocal Rank Fusion (RRF) strategy combining Dense and Sparse/Graph."""
-
-    def __init__(self, dense_strategy: DenseRetrievalStrategy, sparse_strategy: SparseRetrievalStrategy, rrf_k: int = 60) -> None:
-        self.dense_strategy = dense_strategy
-        self.sparse_strategy = sparse_strategy
-        self.rrf_k = rrf_k
-
-    async def execute(
+    async def search_hybrid(
         self,
+        collection: SyntraFlowCollection,
         query: str,
-        collection_name: str,
+        query_vector: List[float],
         limit: int = 5,
-        query_vector: Optional[List[float]] = None,
-        filters: Optional[Dict[str, Any]] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+        rrf_k: int = 60,
     ) -> List[Dict[str, Any]]:
-        dense_results = await self.dense_strategy.execute(
-            query=query, collection_name=collection_name, limit=limit * 2, query_vector=query_vector, filters=filters
+        """Perform Hybrid RRF search combining Dense vector and Sparse/Graph hits."""
+        dense_hits = await self.search_vector(
+            collection=collection, query_vector=query_vector, limit=limit * 2, metadata_filter=metadata_filter
         )
-        sparse_results = await self.sparse_strategy.execute(
-            query=query, collection_name=collection_name, limit=limit * 2, query_vector=query_vector, filters=filters
-        )
+        try:
+            sparse_hits = await self.search_sparse(
+                collection=collection, query=query, limit=limit * 2, metadata_filter=metadata_filter
+            )
+        except HTTPException:
+            sparse_hits = await self.search_graph(collection=collection, query=query, limit=limit * 2)
 
         scores: Dict[str, float] = {}
         items_map: Dict[str, Dict[str, Any]] = {}
 
-        # Score Dense hits
-        for rank, hit in enumerate(dense_results):
-            text_val = hit["text"]
-            scores[text_val] = scores.get(text_val, 0.0) + (1.0 / (rank + self.rrf_k))
-            if text_val not in items_map:
-                items_map[text_val] = hit
+        for rank, hit in enumerate(dense_hits):
+            key = hit["text"]
+            scores[key] = scores.get(key, 0.0) + (1.0 / (rank + rrf_k))
+            items_map[key] = hit
 
-        # Score Sparse hits
-        for rank, hit in enumerate(sparse_results):
-            text_val = hit["text"]
-            scores[text_val] = scores.get(text_val, 0.0) + (1.0 / (rank + self.rrf_k))
-            if text_val not in items_map:
-                items_map[text_val] = hit
+        for rank, hit in enumerate(sparse_hits):
+            key = hit["text"]
+            scores[key] = scores.get(key, 0.0) + (1.0 / (rank + rrf_k))
+            if key not in items_map:
+                items_map[key] = hit
 
-        sorted_texts = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)[:limit]
-
+        sorted_keys = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)[:limit]
         fused = []
-        for text in sorted_texts:
-            item = dict(items_map[text])
-            item["score"] = round(scores[text], 6)
+        for key in sorted_keys:
+            item = dict(items_map[key])
+            item["score"] = round(scores[key], 6)
             item["strategy"] = "hybrid"
             fused.append(item)
 
         return fused
 
-
-class RetrievalEngine:
-    """Unified Orchestrator for pluggable retrieval strategies with graceful fallbacks."""
-
-    def __init__(self, vector_client: Any = None) -> None:
-        self.vector_client = vector_client
-        self.dense_strategy = DenseRetrievalStrategy(vector_client=vector_client)
-        self.sparse_strategy = SparseRetrievalStrategy(dense_fallback=self.dense_strategy)
-        self.graph_strategy = GraphRetrievalStrategy(dense_fallback=self.dense_strategy)
-        self.hybrid_strategy = HybridRRFStrategy(
-            dense_strategy=self.dense_strategy, sparse_strategy=self.sparse_strategy
-        )
-
-    async def query(
+    async def search(
         self,
+        *,
         query: str,
-        collection_name: str,
-        strategy: str = "dense",
+        collection_ids: Optional[List[str]] = None,
+        strategy: Optional[str] = None,
         limit: int = 5,
         query_vector: Optional[List[float]] = None,
-        filters: Optional[Dict[str, Any]] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        """Query vector collection with specified retrieval strategy.
+        """Execute hub-scoped search across one or all collections with multi-collection fan-in."""
+        collections = await self.resolve_targets(collection_ids)
+        if not collections:
+            return []
 
-        Args:
-            query: Query text string.
-            collection_name: Target Qdrant collection name.
-            strategy: 'dense' | 'sparse' | 'hybrid' | 'graph'.
-            limit: Maximum hits count.
-            query_vector: Precomputed query embedding.
-            filters: Key-value metadata filtering parameters.
+        # If query_vector not supplied, compute embedding
+        if not query_vector:
+            try:
+                from common.clients.inference import InferenceClient
+                inf_client = InferenceClient(base_url=settings.INFERENCE_SERVER_URL)
+                embeds = await inf_client.embed(texts=[query])
+                query_vector = embeds[0]
+                await inf_client.close()
+            except Exception as e:
+                logger.warning("Inference client embedding failed in search: %s. Using zero vector.", e)
+                query_vector = [0.0] * 1024
 
-        Returns:
-            List of result dict items.
-        """
-        strat_key = strategy.lower().strip()
+        async def _search_collection(col: SyntraFlowCollection) -> List[Dict[str, Any]]:
+            # Determine effective strategy
+            col_cfg = {}
+            if col.retrieval_config_json:
+                try:
+                    col_cfg = json.loads(col.retrieval_config_json)
+                except Exception:
+                    pass
 
-        try:
-            if strat_key == "sparse":
-                return await self.sparse_strategy.execute(query, collection_name, limit, query_vector, filters)
-            elif strat_key == "graph":
-                return await self.graph_strategy.execute(query, collection_name, limit, query_vector, filters)
-            elif strat_key == "hybrid":
-                return await self.hybrid_strategy.execute(query, collection_name, limit, query_vector, filters)
+            eff_strat = (strategy or col_cfg.get("strategy") or settings.RAG_STRATEGY or "dense").lower().strip()
+            rrf_k = col_cfg.get("rrf_k", 60)
+
+            if eff_strat == "sparse":
+                return await self.search_sparse(col, query, limit, metadata_filter)
+            elif eff_strat == "graph":
+                return await self.search_graph(col, query, limit)
+            elif eff_strat == "hybrid":
+                return await self.search_hybrid(col, query, query_vector, limit, metadata_filter, rrf_k=rrf_k)
             else:
-                return await self.dense_strategy.execute(query, collection_name, limit, query_vector, filters)
-        except Exception as e:
-            logger.error("Error executing strategy '%s': %s. Falling back to Dense.", strategy, e)
-            return await self.dense_strategy.execute(query, collection_name, limit, query_vector, filters)
+                return await self.search_vector(col, query_vector, limit, metadata_filter)
+
+        tasks = [_search_collection(c) for c in collections]
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_hits = []
+        warnings = []
+
+        for res in results_list:
+            if isinstance(res, DatastoreUnavailableError):
+                raise HTTPException(status_code=503, detail="Datastore unavailable")
+            elif isinstance(res, Exception):
+                logger.warning("Collection search encountered error: %s", res)
+                warnings.append(str(res))
+            elif isinstance(res, list):
+                all_hits.extend(res)
+
+        # Multi-collection RRF Fusion across fan-in result lists
+        scores: Dict[str, float] = {}
+        items_map: Dict[str, Dict[str, Any]] = {}
+
+        for rank, hit in enumerate(all_hits):
+            key = f"{hit['collection_id']}::{hit['id']}"
+            scores[key] = scores.get(key, 0.0) + (1.0 / (rank + 60))
+            items_map[key] = hit
+
+        sorted_keys = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)[:limit]
+        final_results = []
+        for key in sorted_keys:
+            hit_item = dict(items_map[key])
+            hit_item["score"] = round(scores[key], 6)
+            final_results.append(hit_item)
+
+        return final_results

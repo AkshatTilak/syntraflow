@@ -600,42 +600,20 @@ async def get_document_chunks(
         "total_count": total_count,
         "limit": limit,
         "offset": offset,
-        "items": items,
-    }
-
-
 @router.post("/search")
-async def search_documents(request: Request, req: SearchRequest) -> dict:
+async def search_documents(request: Request, req: SearchRequest, db: AsyncSession = Depends(get_db)) -> dict:
     """Search indexed documents via Vector, Graph, or Hybrid retrieval."""
-    vector_client = VectorClient()
-    engine = RetrievalEngine(vector_client)
-    inference_client = request.app.state.syntraflow_inference
-
+    engine = RetrievalEngine(db, "default")
     try:
-        # Embed query text
-        try:
-            embeds = await inference_client.embed(texts=[req.query])
-            query_vector = embeds[0]
-        except Exception:
-            logger.warning("Embedding generation failed, utilizing zero-vector.")
-            query_vector = [0.0] * 768
-
-        if req.strategy == "vector":
-            results = await engine.search_vector(query_vector, limit=req.limit)
-        elif req.strategy == "graph":
-            results = await engine.search_graph(req.query, limit=req.limit)
-        else:
-            results = await engine.search_hybrid(req.query, query_vector, limit=req.limit)
-
-        return {
-            "status": "success",
-            "query": req.query,
-            "strategy": req.strategy,
-            "results": results
-        }
+        hits = await engine.search(
+            query=req.query,
+            strategy=req.strategy,
+            limit=req.limit,
+        )
+        return {"status": "success", "query": req.query, "count": len(hits), "results": hits}
     except Exception as e:
         logger.error("Search failed: %s", e)
-        raise HTTPException(status_code=500, detail=f"Retrieval query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 
 @router.delete("/documents/{doc_id}")
@@ -958,19 +936,15 @@ async def delete_collection(collection_id: str, db: AsyncSession = Depends(get_d
 
 
 @router.post("/query")
-async def query_retrieval_engine(payload: QueryCollectionRequest):
+async def query_retrieval_engine(payload: QueryCollectionRequest, db: AsyncSession = Depends(get_db)):
     """Execute search query using pluggable strategy (dense, sparse, hybrid, graph)."""
     try:
-        vector_client = VectorClient()
-        from projects.syntraflow.src.retrieval.engine import RetrievalEngine as ModularEngine
-
-        engine = ModularEngine(vector_client=vector_client)
-        hits = await engine.query(
+        engine = RetrievalEngine(db, "default")
+        hits = await engine.search(
             query=payload.query,
-            collection_name=payload.collection_name or "syntraflow_chunks_v1",
             strategy=payload.strategy or "dense",
             limit=payload.limit or 5,
-            filters=payload.filters,
+            metadata_filter=payload.filters,
         )
         return {
             "status": "success",
