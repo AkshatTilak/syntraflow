@@ -28,14 +28,23 @@ async def process_ingestion_job(
     filename: str,
     temp_filepath: str,
     is_video_audio: bool,
+    *,
+    hub_id: str,
+    collection_id: str,
     chunker_type: Optional[str] = None,
     chunk_size: int = 512,
     chunk_overlap: int = 64,
     pre_processors: Optional[list[str]] = None,
     post_processors: Optional[list[str]] = None,
 ) -> None:
-    """Load file bytes from disk, execute the ingestion pipeline, and clean up."""
-    logger.info("Starting ingestion processing for Job ID: %s (%s)", job_id, filename)
+    """Load file bytes from disk, execute the hub-scoped ingestion pipeline, and clean up."""
+    logger.info(
+        "Starting ingestion processing for Job ID: %s (%s) in hub %s collection %s",
+        job_id,
+        filename,
+        hub_id,
+        collection_id,
+    )
     SessionLocal = get_sessionmaker()
 
     async with SessionLocal() as db:
@@ -48,18 +57,18 @@ async def process_ingestion_job(
             with open(temp_filepath, "rb") as f:
                 file_bytes = f.read()
 
-            # 2. Setup clients
+            # 2. Setup inference client
             inference_client = InferenceClient(base_url=settings.INFERENCE_SERVER_URL)
-            vector_client = VectorClient()
 
-            # 3. Route to proper pipeline
+            # 3. Route to proper pipeline with hub_id and collection_id
             if is_video_audio:
                 await ingest_video_pipeline(
                     video_bytes=file_bytes,
                     video_name=filename,
                     db=db,
                     inference_client=inference_client,
-                    vector_client=vector_client,
+                    hub_id=hub_id,
+                    collection_id=collection_id,
                     job_id=job_id,
                 )
             else:
@@ -68,7 +77,8 @@ async def process_ingestion_job(
                     filename=filename,
                     db=db,
                     inference_client=inference_client,
-                    vector_client=vector_client,
+                    hub_id=hub_id,
+                    collection_id=collection_id,
                     job_id=job_id,
                     chunker_type=chunker_type,
                     chunk_size=chunk_size,
@@ -150,6 +160,12 @@ async def run_ingestion_consumer(app) -> None:
                 filename = job_data["filename"]
                 temp_filepath = job_data["temp_filepath"]
                 is_video_audio = job_data["is_video_audio"]
+                hub_id = job_data.get("hub_id")
+                collection_id = job_data.get("collection_id")
+
+                if not hub_id or not collection_id:
+                    logger.error("Dead-lettering Kafka message for job %s: missing required 'hub_id' or 'collection_id'", job_id)
+                    continue
 
                 # Process job in background
                 asyncio.create_task(
@@ -159,6 +175,13 @@ async def run_ingestion_consumer(app) -> None:
                         filename=filename,
                         temp_filepath=temp_filepath,
                         is_video_audio=is_video_audio,
+                        hub_id=hub_id,
+                        collection_id=collection_id,
+                        chunker_type=job_data.get("chunker_type"),
+                        chunk_size=job_data.get("chunk_size", 512),
+                        chunk_overlap=job_data.get("chunk_overlap", 64),
+                        pre_processors=job_data.get("pre_processors"),
+                        post_processors=job_data.get("post_processors"),
                     )
                 )
             except Exception as pe:

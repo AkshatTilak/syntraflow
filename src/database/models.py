@@ -29,11 +29,16 @@ class SyntraFlowDocument(HubScopedMixin, Base):
     __tablename__ = "syntraflow_documents"
 
     id = Column(Uuid, primary_key=True, default=uuid.uuid4)
+    collection_id = Column(String(36), ForeignKey("syntraflow_collections.id", ondelete="CASCADE"), nullable=False, index=True)
     filename = Column(String(255), nullable=False)
     file_hash = Column(String(64), nullable=True, index=True)  # SHA-256 for duplicate detection
     content = Column(Text, nullable=False)
     layout_json = Column(Text, nullable=True)  # Stores serialized layout structure
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_syntraflow_documents_hub_col", "hub_id", "collection_id"),
+    )
 
     # Relationships
     chunks = relationship("SyntraFlowChunk", back_populates="document", cascade="all, delete-orphan")
@@ -90,12 +95,17 @@ class SyntraFlowJob(HubScopedMixin, Base):
     __tablename__ = "syntraflow_jobs"
 
     id = Column(Uuid, primary_key=True, default=uuid.uuid4)
+    collection_id = Column(String(36), ForeignKey("syntraflow_collections.id", ondelete="CASCADE"), nullable=False, index=True)
     document_id = Column(Uuid, ForeignKey("syntraflow_documents.id"), nullable=True)
     status = Column(String(20), nullable=False, default="queued")  # queued, processing, completed, failed
     progress = Column(Float, default=0.0)
     error_msg = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_syntraflow_jobs_hub_status", "hub_id", "status"),
+    )
 
     # Relationships
     document = relationship("SyntraFlowDocument", back_populates="jobs")

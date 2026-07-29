@@ -18,6 +18,7 @@ from projects.syntraflow.src.database.models import (
     SyntraFlowDocument,
     SyntraFlowChunk,
     SyntraFlowVideoSegment,
+    SyntraFlowCollection,
 )
 from common.clients.qdrant import VectorClient
 
@@ -325,8 +326,14 @@ async def extract_graph_entities(text: str) -> dict:
         return {"entities": [], "relationships": []}
 
 
-async def write_to_neo4j(extractions: list[dict], document_id: Optional[str] = None) -> None:
-    """Deduplicate extracted entities/relationships and batch write them to Neo4j."""
+async def write_to_neo4j(
+    extractions: list[dict],
+    document_id: Optional[str] = None,
+    hub_id: Optional[str] = None,
+    collection_id: Optional[str] = None,
+    db: Optional[AsyncSession] = None,
+) -> None:
+    """Deduplicate extracted entities/relationships and batch write them to Neo4j with hub properties."""
     entities = {}  # name -> {type, description}
     relationships = {}  # (source, target, type) -> description
     
@@ -363,31 +370,40 @@ async def write_to_neo4j(extractions: list[dict], document_id: Optional[str] = N
         return
         
     try:
-        from common.clients.neo4j import get_neo4j_driver
-        driver = get_neo4j_driver()
+        if db and hub_id:
+            from projects.syntraflow.src.datastores import resolve_graph_client
+            driver = await resolve_graph_client(db, hub_id)
+        else:
+            from common.clients.neo4j import get_neo4j_driver
+            driver = get_neo4j_driver()
+
         async with driver.session() as session:
             for name, info in entities.items():
                 await session.run(
-                    "MERGE (e:SyntraFlow_Entity {name: $name}) "
-                    "ON CREATE SET e.type = $type, e.description = $description, e.document_id = $doc_id "
-                    "ON MATCH SET e.document_id = $doc_id, e.description = CASE WHEN e.description IS NULL THEN $description ELSE e.description + ' | ' + $description END",
+                    "MERGE (e:SyntraFlow_Entity {hub_id: $hub_id, name: $name}) "
+                    "ON CREATE SET e.type = $type, e.description = $description, e.document_id = $doc_id, e.collection_id = $col_id "
+                    "ON MATCH SET e.document_id = $doc_id, e.collection_id = $col_id, e.description = CASE WHEN e.description IS NULL THEN $description ELSE e.description + ' | ' + $description END",
                     name=name,
                     type=info["type"],
                     description=info["description"],
-                    doc_id=document_id
+                    doc_id=document_id,
+                    hub_id=hub_id or "default",
+                    col_id=collection_id,
                 )
                 
             for (source, target, rel_type), desc in relationships.items():
                 await session.run(
-                    "MATCH (a:SyntraFlow_Entity {name: $source}), (b:SyntraFlow_Entity {name: $target}) "
+                    "MATCH (a:SyntraFlow_Entity {hub_id: $hub_id, name: $source}), (b:SyntraFlow_Entity {hub_id: $hub_id, name: $target}) "
                     "MERGE (a)-[r:SyntraFlow_RELATION {type: $rel_type}]->(b) "
-                    "ON CREATE SET r.description = $description, r.document_id = $doc_id "
-                    "ON MATCH SET r.document_id = $doc_id, r.description = CASE WHEN r.description IS NULL THEN $description ELSE r.description + ' | ' + $description END",
+                    "ON CREATE SET r.description = $description, r.document_id = $doc_id, r.hub_id = $hub_id, r.collection_id = $col_id "
+                    "ON MATCH SET r.document_id = $doc_id, r.collection_id = $col_id, r.description = CASE WHEN r.description IS NULL THEN $description ELSE r.description + ' | ' + $description END",
                     source=source,
                     target=target,
                     rel_type=rel_type,
                     description=desc,
-                    doc_id=document_id
+                    doc_id=document_id,
+                    hub_id=hub_id or "default",
+                    col_id=collection_id,
                 )
         logger.info("Successfully wrote %d entities and %d relationships to Neo4j.", len(entities), len(relationships))
     except Exception as e:
@@ -619,12 +635,33 @@ async def update_job(
         logger.error("Failed to update job status: %s", e)
 
 
+async def assert_collection_in_hub(
+    db: AsyncSession, hub_id: str, collection_id: str
+) -> SyntraFlowCollection:
+    """Assert collection exists and belongs to hub_id. Raises 404 if missing or foreign."""
+    from fastapi import HTTPException
+    from sqlalchemy import select
+    from projects.syntraflow.src.database.models import SyntraFlowCollection
+
+    stmt = select(SyntraFlowCollection).where(
+        SyntraFlowCollection.id == collection_id,
+        SyntraFlowCollection.hub_id == hub_id,
+    )
+    res = await db.execute(stmt)
+    col = res.scalar_one_or_none()
+    if not col:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    return col
+
+
 async def ingest_document_pipeline(
     file_bytes: bytes,
     filename: str,
     db: AsyncSession,
     inference_client: InferenceClient,
-    vector_client: VectorClient,
+    *,
+    hub_id: str,
+    collection_id: str,
     job_id: Optional[Any] = None,
     chunker_type: Optional[str] = None,
     chunk_size: int = 512,
@@ -632,173 +669,207 @@ async def ingest_document_pipeline(
     pre_processors: Optional[List[str]] = None,
     post_processors: Optional[List[str]] = None,
 ) -> Any:
-    """Ingest a multi-page PDF/image document with batching and Neo4j deduplication."""
-    await update_job(db, job_id, progress=0.1, status="processing")
+    """Ingest a multi-page PDF/image document with hub scoping, batching and Neo4j deduplication."""
+    from fastapi import HTTPException
+    from opentelemetry import trace
+    from projects.syntraflow.src.datastores import resolve_vector_client
 
-    # 0. Pre-processing pipeline
-    if pre_processors:
-        from projects.syntraflow.src.ingestion.processors import get_pre_processor
-        for pre_name in pre_processors:
-            try:
-                pre_proc = get_pre_processor(pre_name)
-                file_bytes = pre_proc.process(file_bytes)
-                logger.info("Executed pre-processor '%s' on %s", pre_name, filename)
-            except Exception as e:
-                logger.warning("Failed pre-processor '%s': %s", pre_name, e)
+    # 0a. Collection Hub Validation
+    collection = await assert_collection_in_hub(db, hub_id, collection_id)
+    vector_client = await resolve_vector_client(db, hub_id)
 
-    # 1. Extract Layout and text using OCR
-    ocr_result = await extract_layout_ocr(file_bytes, filename, inference_client)
-    extracted_text = ocr_result.get("text", "")
-    await update_job(db, job_id, progress=0.4, status="processing")
-    
-    # 2. Save Document to Postgres
-    import hashlib
-    file_hash = hashlib.sha256(file_bytes).hexdigest()
-    doc = SyntraFlowDocument(
-        filename=filename,
-        file_hash=file_hash,
-        content=extracted_text,
-        layout_json=json.dumps(ocr_result)
-    )
-    db.add(doc)
-    await db.commit()
-    await db.refresh(doc)
+    tracer = trace.get_tracer("syntraflow")
+    with tracer.start_as_current_span("syntraflow.ingest_document") as span:
+        span.set_attribute("hub_id", hub_id)
+        span.set_attribute("collection_id", collection_id)
+        span.set_attribute("filename", filename)
 
-    # Link document to job
-    if job_id:
-        from projects.syntraflow.src.database.models import SyntraFlowJob
-        from sqlalchemy import update
-        try:
-            stmt = (
-                update(SyntraFlowJob)
-                .where(SyntraFlowJob.id == job_id)
-                .values(document_id=doc.id)
-            )
-            await db.execute(stmt)
-            await db.commit()
-        except Exception as job_err:
-            logger.error("Failed to link document ID to job: %s", job_err)
-    
-    # 3. Dynamic Chunking Strategy
-    if chunker_type and chunker_type.strip():
-        from projects.syntraflow.src.ingestion.strategies import ChunkerConfig
-        from projects.syntraflow.src.ingestion.chunkers import get_chunker
-        cfg = ChunkerConfig(strategy=chunker_type, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        chunker_instance = get_chunker(cfg)
-        raw_chunks = chunker_instance.chunk(extracted_text or "Empty document")
-        chunks_data = [
-            {
-                "text": item["text"],
-                "metadata": {
-                    "hierarchy": [],
-                    "bbox_list": [],
-                    "strategy": item.get("strategy", chunker_type),
-                },
-            }
-            for item in raw_chunks
-        ]
-    else:
-        chunks_data = chunk_document_layout_aware(ocr_result)
+        await update_job(db, job_id, progress=0.1, status="processing")
 
-    if not chunks_data:
-        chunks_data = [{"text": extracted_text or "Empty document", "metadata": {"hierarchy": [], "bbox_list": []}}]
+        # 0b. Pre-processing pipeline
+        if pre_processors:
+            from projects.syntraflow.src.ingestion.processors import get_pre_processor
+            for pre_name in pre_processors:
+                try:
+                    pre_proc = get_pre_processor(pre_name)
+                    file_bytes = pre_proc.process(file_bytes)
+                    logger.info("Executed pre-processor '%s' on %s", pre_name, filename)
+                except Exception as e:
+                    logger.warning("Failed pre-processor '%s': %s", pre_name, e)
 
-    # 3b. Post-processing Enrichment
-    if post_processors:
-        from projects.syntraflow.src.ingestion.processors import get_post_processor
-        for post_name in post_processors:
-            post_proc = get_post_processor(post_name)
-            for idx in range(len(chunks_data)):
-                chunks_data[idx] = post_proc.enrich(chunks_data[idx])
-            logger.info("Executed post-processor '%s' on %d chunks", post_name, len(chunks_data))
+        # 1. Extract Layout and text using OCR
+        ocr_result = await extract_layout_ocr(file_bytes, filename, inference_client)
+        extracted_text = ocr_result.get("text", "")
+        await update_job(db, job_id, progress=0.4, status="processing")
         
-    # 4. Generate Embeddings in batch
-    chunk_texts = [c["text"] for c in chunks_data]
-    try:
-        all_embeddings = []
-        batch_size = 32
-        for i in range(0, len(chunk_texts), batch_size):
-            batch_texts = chunk_texts[i:i+batch_size]
-            embeds = await inference_client.embed(texts=batch_texts)
-            all_embeddings.extend(embeds)
-    except Exception as e:
-        logger.warning("Failed to generate embeddings via inference client: %s. Using fallback zero-vectors.", e)
-        dim = 1024
-        try:
-            from common.models.registry import get_active_model
-            embed_spec = await get_active_model("embedding")
-            if embed_spec.vector_dim:
-                dim = embed_spec.vector_dim
-        except Exception:
-            pass
-        all_embeddings = [[0.0] * dim for _ in chunk_texts]
-        
-    # Write chunks to Postgres and prepare Qdrant PointStructs
-    qdrant_points = []
-    for idx, chunk_info in enumerate(chunks_data):
-        chunk_text = chunk_info["text"]
-        chunk_meta = chunk_info["metadata"]
-        vector = all_embeddings[idx]
-        
-        # Save chunk to Postgres
-        sf_chunk = SyntraFlowChunk(
-            document_id=doc.id,
-            chunk_index=idx,
-            text=chunk_text,
-            metadata_json=json.dumps({
-                "filename": filename,
-                "ocr_provider": settings.OCR_PROVIDER,
-                "hierarchy": chunk_meta.get("hierarchy", []),
-                "bbox_list": chunk_meta.get("bbox_list", [])
-            })
+        # 2. Save Document to Postgres
+        import hashlib
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+        # Check duplicate hash scoped to (hub_id, collection_id)
+        from sqlalchemy import select
+        dup_stmt = select(SyntraFlowDocument).where(
+            SyntraFlowDocument.file_hash == file_hash,
+            SyntraFlowDocument.hub_id == hub_id,
+            SyntraFlowDocument.collection_id == collection_id,
         )
-        db.add(sf_chunk)
+        dup_res = await db.execute(dup_stmt)
+        if dup_res.scalars().first():
+            logger.info("Duplicate document hash %s in hub %s collection %s. Skipping.", file_hash, hub_id, collection_id)
+
+        doc = SyntraFlowDocument(
+            hub_id=hub_id,
+            collection_id=collection_id,
+            filename=filename,
+            file_hash=file_hash,
+            content=extracted_text,
+            layout_json=json.dumps(ocr_result)
+        )
+        db.add(doc)
         await db.commit()
-        await db.refresh(sf_chunk)
-        
-        # Store PointStruct for Qdrant
-        qdrant_points.append(
-            PointStruct(
-                id=sf_chunk.id,
-                vector=vector,
-                payload={
-                    "document_id": doc.id,
-                    "chunk_index": idx,
-                    "text": chunk_text,
-                    "filename": filename,
-                }
-            )
-        )
-        
-    # Write to Qdrant collection in batches of 100
-    qdrant_batch_size = 100
-    for i in range(0, len(qdrant_points), qdrant_batch_size):
-        batch_points = qdrant_points[i:i+qdrant_batch_size]
-        try:
-            vector_client.get_client().upsert(
-                collection_name="syntraflow_chunks_v1",
-                points=batch_points
-            )
-        except Exception as e:
-            logger.error("Failed to write batch to Qdrant: %s", e)
-            
-    await update_job(db, job_id, progress=0.7, status="processing")
+        await db.refresh(doc)
 
-    # 5. Parallel KG Entity Extraction per chunk (using semaphore to limit concurrency)
-    import asyncio
-    sem = asyncio.Semaphore(5)
-    async def sem_extract(txt):
-        async with sem:
-            return await extract_graph_entities(txt)
+        # Link document to job
+        if job_id:
+            from projects.syntraflow.src.database.models import SyntraFlowJob
+            from sqlalchemy import update
+            try:
+                stmt = (
+                    update(SyntraFlowJob)
+                    .where(SyntraFlowJob.id == job_id)
+                    .values(document_id=doc.id, hub_id=hub_id, collection_id=collection_id)
+                )
+                await db.execute(stmt)
+                await db.commit()
+            except Exception as job_err:
+                logger.error("Failed to link document ID to job: %s", job_err)
+        
+        # 3. Dynamic Chunking Strategy
+        if chunker_type and chunker_type.strip():
+            from projects.syntraflow.src.ingestion.strategies import ChunkerConfig
+            from projects.syntraflow.src.ingestion.chunkers import get_chunker
+            cfg = ChunkerConfig(strategy=chunker_type, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            chunker_instance = get_chunker(cfg)
+            raw_chunks = chunker_instance.chunk(extracted_text or "Empty document")
+            chunks_data = [
+                {
+                    "text": item["text"],
+                    "metadata": {
+                        "hierarchy": [],
+                        "bbox_list": [],
+                        "strategy": item.get("strategy", chunker_type),
+                    },
+                }
+                for item in raw_chunks
+            ]
+        else:
+            chunks_data = chunk_document_layout_aware(ocr_result)
+
+        if not chunks_data:
+            chunks_data = [{"text": extracted_text or "Empty document", "metadata": {"hierarchy": [], "bbox_list": []}}]
+
+        # 3b. Post-processing Enrichment
+        if post_processors:
+            from projects.syntraflow.src.ingestion.processors import get_post_processor
+            for post_name in post_processors:
+                post_proc = get_post_processor(post_name)
+                for idx in range(len(chunks_data)):
+                    chunks_data[idx] = post_proc.enrich(chunks_data[idx])
+                logger.info("Executed post-processor '%s' on %d chunks", post_name, len(chunks_data))
             
-    tasks = [sem_extract(txt) for txt in chunk_texts]
-    extractions = await asyncio.gather(*tasks)
-    
-    # Write deduplicated entities to Neo4j
-    await write_to_neo4j(extractions, document_id=str(doc.id))
-    
-    await update_job(db, job_id, progress=1.0, status="completed")
-    return doc.id
+        # 4. Generate Embeddings in batch
+        chunk_texts = [c["text"] for c in chunks_data]
+        try:
+            all_embeddings = []
+            batch_size = 32
+            for i in range(0, len(chunk_texts), batch_size):
+                batch_texts = chunk_texts[i:i+batch_size]
+                embeds = await inference_client.embed(texts=batch_texts)
+                all_embeddings.extend(embeds)
+        except Exception as e:
+            logger.warning("Failed to generate embeddings via inference client: %s. Using fallback zero-vectors.", e)
+            dim = int(collection.vector_dimension) if collection.vector_dimension else 1024
+            all_embeddings = [[0.0] * dim for _ in chunk_texts]
+
+        # Check vector dimension mismatch
+        if all_embeddings and len(all_embeddings[0]) != int(collection.vector_dimension):
+            raise HTTPException(status_code=409, detail="Embedding dimension mismatch")
+            
+        # Write chunks to Postgres and prepare Qdrant PointStructs
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        qdrant_points = []
+        for idx, chunk_info in enumerate(chunks_data):
+            chunk_text = chunk_info["text"]
+            chunk_meta = chunk_info["metadata"]
+            vector = all_embeddings[idx]
+            
+            # Save chunk to Postgres
+            sf_chunk = SyntraFlowChunk(
+                hub_id=hub_id,
+                document_id=doc.id,
+                chunk_index=idx,
+                text=chunk_text,
+                metadata_json=json.dumps({
+                    "filename": filename,
+                    "ocr_provider": settings.OCR_PROVIDER,
+                    "hierarchy": chunk_meta.get("hierarchy", []),
+                    "bbox_list": chunk_meta.get("bbox_list", [])
+                })
+            )
+            db.add(sf_chunk)
+            await db.commit()
+            await db.refresh(sf_chunk)
+            
+            # Store PointStruct for Qdrant
+            qdrant_points.append(
+                PointStruct(
+                    id=str(sf_chunk.id),
+                    vector=vector,
+                    payload={
+                        "hub_id": hub_id,
+                        "collection_id": collection_id,
+                        "document_id": str(doc.id),
+                        "chunk_index": idx,
+                        "text": chunk_text,
+                        "filename": filename,
+                        "tags": [],
+                        "timestamp": now_iso,
+                        "access_level": "read",
+                    }
+                )
+            )
+            
+        # Write to Qdrant collection in batches of 100 using physical collection name
+        qdrant_batch_size = 100
+        for i in range(0, len(qdrant_points), qdrant_batch_size):
+            batch_points = qdrant_points[i:i+qdrant_batch_size]
+            try:
+                vector_client.get_client().upsert(
+                    collection_name=collection.physical_name,
+                    points=batch_points
+                )
+            except Exception as e:
+                logger.error("Failed to write batch to Qdrant physical collection %s: %s", collection.physical_name, e)
+                
+        await update_job(db, job_id, progress=0.7, status="processing")
+
+        # 5. Parallel KG Entity Extraction per chunk
+        import asyncio
+        sem = asyncio.Semaphore(5)
+        async def sem_extract(txt):
+            async with sem:
+                return await extract_graph_entities(txt)
+                
+        tasks = [sem_extract(txt) for txt in chunk_texts]
+        extractions = await asyncio.gather(*tasks)
+        
+        # Write deduplicated entities to Neo4j
+        await write_to_neo4j(extractions, document_id=str(doc.id), hub_id=hub_id, collection_id=collection_id, db=db)
+        
+        await update_job(db, job_id, progress=1.0, status="completed")
+        return doc.id
 
 
 async def ingest_video_pipeline(
@@ -806,183 +877,205 @@ async def ingest_video_pipeline(
     video_name: str,
     db: AsyncSession,
     inference_client: InferenceClient,
-    vector_client: VectorClient,
+    *,
+    hub_id: str,
+    collection_id: str,
     job_id: Optional[Any] = None,
 ) -> List[Any]:
     """Ingest MP4 Video/Audio files with FFmpeg demuxing, keyframes description, and alignment."""
-    logger.info("Starting video ingestion pipeline for: %s", video_name)
-    await update_job(db, job_id, progress=0.1, status="processing")
-    
-    # 1. Demux audio using FFmpeg and call ASR transcription
-    try:
-        audio_bytes = await demux_audio(video_bytes, video_name)
-        asr_result = await inference_client.transcribe(audio_bytes, filename="audio.wav")
-    except Exception as e:
-        logger.warning("FFmpeg demux or transcription failed: %s. Using fallback mock transcript.", e)
-        asr_result = {
-            "text": "This is a fallback video transcript.",
-            "segments": [
-                {"start": 0.0, "end": 5.0, "text": "This is a fallback video transcript", "confidence": 0.9},
-                {"start": 5.0, "end": 10.0, "text": "to align with visual frames.", "confidence": 0.9}
-            ],
-            "emotion": "neutral",
-            "audio_events": ["laughter"],
-            "language": "en"
-        }
-    await update_job(db, job_id, progress=0.4, status="processing")
-    
-    # 2. Extract scene-change keyframes with timestamps
-    try:
-        keyframes = await extract_keyframes_with_timestamps(video_bytes, video_name)
-    except Exception as e:
-        logger.warning("Keyframe extraction failed: %s. Using empty keyframes list.", e)
-        keyframes = []
+    from fastapi import HTTPException
+    from opentelemetry import trace
+    from projects.syntraflow.src.datastores import resolve_vector_client
+
+    collection = await assert_collection_in_hub(db, hub_id, collection_id)
+    vector_client = await resolve_vector_client(db, hub_id)
+
+    tracer = trace.get_tracer("syntraflow")
+    with tracer.start_as_current_span("syntraflow.ingest_video") as span:
+        span.set_attribute("hub_id", hub_id)
+        span.set_attribute("collection_id", collection_id)
+        span.set_attribute("video_name", video_name)
+
+        logger.info("Starting video ingestion pipeline for: %s in hub %s collection %s", video_name, hub_id, collection_id)
+        await update_job(db, job_id, progress=0.1, status="processing")
         
-    # 3. Generate keyframe visual summaries via Gemini Flash cloud LLM in parallel
-    import asyncio
-    sem = asyncio.Semaphore(5)
-    async def sem_describe(kf_item):
-        async with sem:
-            desc = await describe_keyframe(kf_item["image_bytes"], kf_item["filename"])
-            kf_item["description"] = desc
-            
-    if keyframes:
-        describe_tasks = [sem_describe(kf) for kf in keyframes]
-        await asyncio.gather(*describe_tasks)
-        
-    await update_job(db, job_id, progress=0.7, status="processing")
-    
-    # 4. Save video document parent to PostgreSQL
-    import hashlib
-    file_hash = hashlib.sha256(video_bytes).hexdigest()
-    doc = SyntraFlowDocument(
-        filename=video_name,
-        file_hash=file_hash,
-        content=asr_result.get("text", ""),
-        layout_json=None
-    )
-    db.add(doc)
-    await db.commit()
-    await db.refresh(doc)
-    
-    # Link job to document
-    if job_id:
-        from projects.syntraflow.src.database.models import SyntraFlowJob
-        from sqlalchemy import update
+        # 1. Demux audio using FFmpeg and call ASR transcription
         try:
-            stmt = (
-                update(SyntraFlowJob)
-                .where(SyntraFlowJob.id == job_id)
-                .values(document_id=doc.id)
-            )
-            await db.execute(stmt)
-            await db.commit()
-        except Exception as job_err:
-            logger.error("Failed to link video document ID to job: %s", job_err)
-            
-    # 5. Temporal Aligner: align ASR segments with keyframes chronologically
-    segments = asr_result.get("segments", [])
-    if not segments:
-        segments = [{"start": 0.0, "end": 10.0, "text": asr_result.get("text") or "No audio transcript."}]
-        
-    video_segments_data = []
-    for seg in segments:
-        start = seg.get("start", 0.0)
-        end = seg.get("end", 0.0)
-        text = seg.get("text", "")
-        
-        aligned_descs = []
-        for kf in keyframes:
-            if start <= kf["timestamp"] <= end:
-                aligned_descs.append(kf["description"])
-                
-        if not aligned_descs and keyframes:
-            closest_kf = min(keyframes, key=lambda kf: abs(kf["timestamp"] - ((start + end) / 2.0)))
-            aligned_descs.append(closest_kf["description"])
-            
-        visual_context = " | ".join(aligned_descs) if aligned_descs else "No visual content description."
-        seg_summary = f"{text}. Visual context: {visual_context}"
-        
-        video_segments_data.append({
-            "start": start,
-            "end": end,
-            "text": text,
-            "visual_summary": seg_summary
-        })
-        
-    # 6. Generate embeddings for the aligned summaries in batch
-    summaries_to_embed = [seg["visual_summary"] for seg in video_segments_data]
-    try:
-        all_embeddings = []
-        batch_size = 32
-        for i in range(0, len(summaries_to_embed), batch_size):
-            batch_texts = summaries_to_embed[i:i+batch_size]
-            embeds = await inference_client.embed(texts=batch_texts)
-            all_embeddings.extend(embeds)
-    except Exception as e:
-        logger.warning("Failed to embed video segments: %s. Using fallback zero-vectors.", e)
-        dim = 1024
-        try:
-            from common.models.registry import get_active_model
-            embed_spec = await get_active_model("embedding")
-            if embed_spec.vector_dim:
-                dim = embed_spec.vector_dim
-        except Exception:
-            pass
-        all_embeddings = [[0.0] * dim for _ in summaries_to_embed]
-        
-    # 7. Write video segments to Postgres and Qdrant in batch
-    segment_ids = []
-    qdrant_points = []
-    
-    for idx, seg in enumerate(video_segments_data):
-        start = seg["start"]
-        end = seg["end"]
-        text = seg["text"]
-        seg_summary = seg["visual_summary"]
-        vector = all_embeddings[idx]
-        
-        video_seg = SyntraFlowVideoSegment(
-            document_id=doc.id,
-            video_name=video_name,
-            start_time=start,
-            end_time=end,
-            transcript=text,
-            visual_summary=seg_summary,
-            emotion_tags=asr_result.get("emotion", "neutral"),
-            audio_events=",".join(asr_result.get("audio_events", [])) if asr_result.get("audio_events") else None
-        )
-        db.add(video_seg)
-        await db.commit()
-        await db.refresh(video_seg)
-        segment_ids.append(video_seg.id)
-        
-        qdrant_points.append(
-            PointStruct(
-                id=video_seg.id,
-                vector=vector,
-                payload={
-                    "document_id": doc.id,
-                    "video_name": video_name,
-                    "start_time": start,
-                    "end_time": end,
-                    "text": seg_summary,
-                    "filename": video_name,
-                }
-            )
-        )
-        
-    # Write to Qdrant collection in batches of 100
-    qdrant_batch_size = 100
-    for i in range(0, len(qdrant_points), qdrant_batch_size):
-        batch_points = qdrant_points[i:i+qdrant_batch_size]
-        try:
-            vector_client.get_client().upsert(
-                collection_name="syntraflow_chunks_v1",
-                points=batch_points
-            )
+            audio_bytes = await demux_audio(video_bytes, video_name)
+            asr_result = await inference_client.transcribe(audio_bytes, filename="audio.wav")
         except Exception as e:
-            logger.error("Failed to write video segment batch to Qdrant: %s", e)
+            logger.warning("FFmpeg demux or transcription failed: %s. Using fallback mock transcript.", e)
+            asr_result = {
+                "text": "This is a fallback video transcript.",
+                "segments": [
+                    {"start": 0.0, "end": 5.0, "text": "This is a fallback video transcript", "confidence": 0.9},
+                    {"start": 5.0, "end": 10.0, "text": "to align with visual frames.", "confidence": 0.9}
+                ],
+                "emotion": "neutral",
+                "audio_events": ["laughter"],
+                "language": "en"
+            }
+        await update_job(db, job_id, progress=0.4, status="processing")
+        
+        # 2. Extract scene-change keyframes with timestamps
+        try:
+            keyframes = await extract_keyframes_with_timestamps(video_bytes, video_name)
+        except Exception as e:
+            logger.warning("Keyframe extraction failed: %s. Using empty keyframes list.", e)
+            keyframes = []
             
-    await update_job(db, job_id, progress=1.0, status="completed")
-    return segment_ids
+        # 3. Generate keyframe visual summaries via Gemini Flash cloud LLM in parallel
+        import asyncio
+        sem = asyncio.Semaphore(5)
+        async def sem_describe(kf_item):
+            async with sem:
+                desc = await describe_keyframe(kf_item["image_bytes"], kf_item["filename"])
+                kf_item["description"] = desc
+                
+        if keyframes:
+            describe_tasks = [sem_describe(kf) for kf in keyframes]
+            await asyncio.gather(*describe_tasks)
+            
+        await update_job(db, job_id, progress=0.7, status="processing")
+        
+        # 4. Save video document parent to PostgreSQL
+        import hashlib
+        file_hash = hashlib.sha256(video_bytes).hexdigest()
+        doc = SyntraFlowDocument(
+            hub_id=hub_id,
+            collection_id=collection_id,
+            filename=video_name,
+            file_hash=file_hash,
+            content=asr_result.get("text", ""),
+            layout_json=None
+        )
+        db.add(doc)
+        await db.commit()
+        await db.refresh(doc)
+        
+        # Link job to document
+        if job_id:
+            from projects.syntraflow.src.database.models import SyntraFlowJob
+            from sqlalchemy import update
+            try:
+                stmt = (
+                    update(SyntraFlowJob)
+                    .where(SyntraFlowJob.id == job_id)
+                    .values(document_id=doc.id, hub_id=hub_id, collection_id=collection_id)
+                )
+                await db.execute(stmt)
+                await db.commit()
+            except Exception as job_err:
+                logger.error("Failed to link video document ID to job: %s", job_err)
+                
+        # 5. Temporal Aligner: align ASR segments with keyframes chronologically
+        segments = asr_result.get("segments", [])
+        if not segments:
+            segments = [{"start": 0.0, "end": 10.0, "text": asr_result.get("text") or "No audio transcript."}]
+            
+        video_segments_data = []
+        for seg in segments:
+            start = seg.get("start", 0.0)
+            end = seg.get("end", 0.0)
+            text = seg.get("text", "")
+            
+            aligned_descs = []
+            for kf in keyframes:
+                if start <= kf["timestamp"] <= end:
+                    aligned_descs.append(kf["description"])
+                    
+            if not aligned_descs and keyframes:
+                closest_kf = min(keyframes, key=lambda kf: abs(kf["timestamp"] - ((start + end) / 2.0)))
+                aligned_descs.append(closest_kf["description"])
+                
+            visual_context = " | ".join(aligned_descs) if aligned_descs else "No visual content description."
+            seg_summary = f"{text}. Visual context: {visual_context}"
+            
+            video_segments_data.append({
+                "start": start,
+                "end": end,
+                "text": text,
+                "visual_summary": seg_summary
+            })
+            
+        # 6. Generate embeddings for the aligned summaries in batch
+        summaries_to_embed = [seg["visual_summary"] for seg in video_segments_data]
+        try:
+            all_embeddings = []
+            batch_size = 32
+            for i in range(0, len(summaries_to_embed), batch_size):
+                batch_texts = summaries_to_embed[i:i+batch_size]
+                embeds = await inference_client.embed(texts=batch_texts)
+                all_embeddings.extend(embeds)
+        except Exception as e:
+            logger.warning("Failed to embed video segments: %s. Using fallback zero-vectors.", e)
+            dim = int(collection.vector_dimension) if collection.vector_dimension else 1024
+            all_embeddings = [[0.0] * dim for _ in summaries_to_embed]
+
+        if all_embeddings and len(all_embeddings[0]) != int(collection.vector_dimension):
+            raise HTTPException(status_code=409, detail="Embedding dimension mismatch")
+            
+        # 7. Write video segments to Postgres and Qdrant in batch
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        segment_ids = []
+        qdrant_points = []
+        
+        for idx, seg in enumerate(video_segments_data):
+            start = seg["start"]
+            end = seg["end"]
+            text = seg["text"]
+            seg_summary = seg["visual_summary"]
+            vector = all_embeddings[idx]
+            
+            video_seg = SyntraFlowVideoSegment(
+                hub_id=hub_id,
+                document_id=doc.id,
+                video_name=video_name,
+                start_time=start,
+                end_time=end,
+                transcript=text,
+                visual_summary=seg_summary,
+                emotion_tags=asr_result.get("emotion", "neutral"),
+                audio_events=",".join(asr_result.get("audio_events", [])) if asr_result.get("audio_events") else None
+            )
+            db.add(video_seg)
+            await db.commit()
+            await db.refresh(video_seg)
+            segment_ids.append(video_seg.id)
+            
+            qdrant_points.append(
+                PointStruct(
+                    id=str(video_seg.id),
+                    vector=vector,
+                    payload={
+                        "hub_id": hub_id,
+                        "collection_id": collection_id,
+                        "document_id": str(doc.id),
+                        "video_name": video_name,
+                        "start_time": start,
+                        "end_time": end,
+                        "text": seg_summary,
+                        "filename": video_name,
+                        "tags": [],
+                        "timestamp": now_iso,
+                        "access_level": "read",
+                    }
+                )
+            )
+            
+        # Write to Qdrant collection in batches of 100
+        qdrant_batch_size = 100
+        for i in range(0, len(qdrant_points), qdrant_batch_size):
+            batch_points = qdrant_points[i:i+qdrant_batch_size]
+            try:
+                vector_client.get_client().upsert(
+                    collection_name=collection.physical_name,
+                    points=batch_points
+                )
+            except Exception as e:
+                logger.error("Failed to write video segment batch to Qdrant physical collection %s: %s", collection.physical_name, e)
+                
+        await update_job(db, job_id, progress=1.0, status="completed")
+        return segment_ids
