@@ -7,7 +7,7 @@ Alembic migration support across the monorepo.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Index, String, Text, UniqueConstraint, Uuid
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Index, JSON, String, Text, UniqueConstraint, Uuid
 from sqlalchemy.orm import relationship
 
 from common.models.database import Base, HubScopedMixin
@@ -15,7 +15,10 @@ from common.models.database import Base, HubScopedMixin
 
 def build_physical_name(hub_slug: str, name: str) -> str:
     """Build canonical global Qdrant physical collection name from hub_slug and collection name."""
-    return f"{hub_slug}__{name}"
+    import re
+    slug_clean = re.sub(r"[^a-z0-9_]+", "_", hub_slug.lower())
+    name_clean = re.sub(r"[^a-z0-9_]+", "_", name.lower())
+    return f"{slug_clean}__{name_clean}"
 
 
 class SyntraFlowDocument(HubScopedMixin, Base):
@@ -107,13 +110,16 @@ class SyntraFlowCollection(HubScopedMixin, Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String(255), nullable=False, index=True)
-    physical_name = Column(String(300), nullable=False, index=True)  # "{hub_slug}__{name}", globally unique
+    physical_name = Column(String(320), nullable=False, index=True)  # "{hub_slug}__{name}", globally unique
     embedding_model = Column(String(255), nullable=False, default="jina-clip-v2")
     vector_dimension = Column(Float, nullable=False, default=1024)
     description = Column(Text, nullable=True)
+    retrieval_config_json = Column(JSON, nullable=False, default=dict)
+    datastore_binding_id = Column(String(36), ForeignKey("datastore_bindings.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
         UniqueConstraint("hub_id", "name", name="uq_syntraflow_collections_hub_name"),
         UniqueConstraint("physical_name", name="uq_syntraflow_collections_physical_name"),
     )
+
