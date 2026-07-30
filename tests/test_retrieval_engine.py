@@ -21,7 +21,7 @@ async def test_dense_retrieval_strategy_mocked():
     mock_hit = MagicMock()
     mock_hit.id = "hit_1"
     mock_hit.score = 0.95
-    mock_hit.payload = {"text": "Dense retrieval test text", "tenant_id": "test_tenant"}
+    mock_hit.payload = {"text": "Dense retrieval test text", "hub_id": "test_hub"}
     mock_qdrant.search.return_value = [mock_hit]
 
     strategy = DenseRetrievalStrategy(vector_client=mock_vector_client)

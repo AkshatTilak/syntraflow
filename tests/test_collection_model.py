@@ -18,9 +18,10 @@ def test_syntraflow_collection_crud():
 
     collection_id = uuid.uuid4()
     col = SyntraFlowCollection(
-        id=collection_id,
+        id=str(collection_id),
+        hub_id="hub_alpha",
         name="test_collection_docs",
-        tenant_id="tenant_alpha",
+        physical_name="hub_alpha__test_collection_docs",
         embedding_model="jina-clip-v2",
         vector_dimension=1024,
         description="Collection for test documents",
@@ -31,8 +32,8 @@ def test_syntraflow_collection_crud():
     # Query back
     queried = session.query(SyntraFlowCollection).filter_by(name="test_collection_docs").first()
     assert queried is not None
-    assert queried.id == collection_id
-    assert queried.tenant_id == "tenant_alpha"
+    assert queried.id == str(collection_id)
+    assert queried.hub_id == "hub_alpha"
     assert queried.embedding_model == "jina-clip-v2"
     assert queried.vector_dimension == 1024
     assert queried.description == "Collection for test documents"

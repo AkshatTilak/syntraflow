@@ -7,7 +7,7 @@ from qdrant_client.http import models as qdrant_models
 
 logger = logging.getLogger("syntraflow.ingestion.vector_writer")
 
-REQUIRED_PAYLOAD_KEYS = {"tenant_id", "document_id"}
+REQUIRED_PAYLOAD_KEYS = {"hub_id", "document_id"}
 DEFAULT_ACCESS_LEVEL = "public"
 
 
@@ -21,8 +21,8 @@ def validate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         Cleaned payload dictionary containing required standard keys.
     """
     validated = dict(payload)
-    if "tenant_id" not in validated or not validated["tenant_id"]:
-        validated["tenant_id"] = "default"
+    if "hub_id" not in validated or not validated["hub_id"]:
+        validated["hub_id"] = "default"
     if "document_id" not in validated:
         validated["document_id"] = "unknown"
     if "tags" not in validated or not isinstance(validated["tags"], list):
