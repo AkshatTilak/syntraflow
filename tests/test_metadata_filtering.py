@@ -1,7 +1,5 @@
 """Unit tests for metadata payload validation and Qdrant filter building."""
 
-import pytest
-from qdrant_client.http import models as qdrant_models
 from projects.syntraflow.src.ingestion.vector_writer import (
     validate_payload,
     build_qdrant_filter,

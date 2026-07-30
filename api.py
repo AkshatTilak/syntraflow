@@ -8,8 +8,17 @@ Only GET /status remains as the microservice health probe.
 import logging
 from fastapi import APIRouter, Request
 
+import re
+
 router = APIRouter(tags=["syntraflow"])
 logger = logging.getLogger("syntraflow.api")
+
+
+def sanitize_filename(filename: str) -> str:
+    """Sanitize filename to prevent path traversal and special characters."""
+    clean_name = filename.replace("\\", "/").split("/")[-1]
+    clean_name = re.sub(r"[^a-zA-Z0-9._-]", "_", clean_name)
+    return clean_name or "unnamed"
 
 
 @router.get("/status")

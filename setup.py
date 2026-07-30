@@ -6,7 +6,6 @@ Initializes PostgreSQL database tables, Qdrant collections, and the inference cl
 
 from fastapi import FastAPI
 from qdrant_client.http.models import Distance, VectorParams
-from qdrant_client.http.exceptions import UnexpectedResponse
 
 from common.clients.inference import InferenceClient
 from common.clients.qdrant import VectorClient

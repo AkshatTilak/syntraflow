@@ -3,13 +3,12 @@
 import logging
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, update, delete
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.config.settings import get_settings
 from common.models.database import AuditLog, DatastoreBinding, Hub
 from common.models.hub_enums import STORE_TYPES
-from projects.syntraflow.src.collections.schemas import CollectionRetrievalConfig
 from projects.syntraflow.src.database.models import SyntraFlowCollection
 from projects.syntraflow.src.datastores.crypto import (
     decrypt_credentials,

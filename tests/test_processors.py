@@ -1,6 +1,5 @@
 """Unit tests for SyntraFlow PreProcessors and PostProcessors."""
 
-import pytest
 from projects.syntraflow.src.ingestion.processors import (
     OCRNoiseReduction,
     LanguageFilter,

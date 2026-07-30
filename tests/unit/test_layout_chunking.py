@@ -1,4 +1,3 @@
-import pytest
 from projects.syntraflow.src.ingestion import chunk_document_layout_aware, count_tokens
 
 def test_count_tokens():

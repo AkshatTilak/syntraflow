@@ -20,7 +20,6 @@ from projects.syntraflow.src.database.models import (
     SyntraFlowVideoSegment,
     SyntraFlowCollection,
 )
-from common.clients.qdrant import VectorClient
 
 logger = logging.getLogger("syntraflow.ingestion")
 

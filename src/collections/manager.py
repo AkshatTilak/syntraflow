@@ -13,7 +13,7 @@ from common.clients.qdrant import VectorClient
 from common.config.settings import get_settings
 from common.models.database import Hub
 from projects.syntraflow.src.collections.schemas import CollectionRetrievalConfig
-from projects.syntraflow.src.database.models import SyntraFlowCollection, SyntraFlowDocument, SyntraFlowChunk, build_physical_name
+from projects.syntraflow.src.database.models import SyntraFlowCollection, SyntraFlowDocument, SyntraFlowChunk
 
 logger = logging.getLogger("syntraflow.collections.manager")
 

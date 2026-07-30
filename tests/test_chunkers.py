@@ -1,6 +1,5 @@
 """Unit tests for SyntraFlow chunker implementations."""
 
-import pytest
 from projects.syntraflow.src.ingestion.strategies import ChunkerConfig
 from projects.syntraflow.src.ingestion.chunkers import (
     FixedSizeChunking,

@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 from common.clients.qdrant import VectorClient
 from common.config.settings import get_settings
 from common.models.database import DatastoreBinding
-from projects.syntraflow.src.datastores.crypto import decrypt_credentials, mask_uri
+from projects.syntraflow.src.datastores.crypto import decrypt_credentials
 
 logger = logging.getLogger("syntraflow.datastores.resolver")
 

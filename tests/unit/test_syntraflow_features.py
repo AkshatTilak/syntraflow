@@ -2,7 +2,6 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, mock_open
 
-from projects.syntraflow.src.ingestion import count_tokens
 
 @pytest.mark.asyncio
 async def test_demux_audio():

@@ -6,7 +6,7 @@ Includes OCRNoiseReduction, LanguageFilter, MetadataExtractor, and SummaryTagger
 import logging
 import re
 import unicodedata
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 from projects.syntraflow.src.ingestion.strategies import (
     BasePostProcessor,

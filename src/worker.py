@@ -7,11 +7,10 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Optional
+from typing import Optional
 
 from common.config.settings import settings
 from common.clients.inference import InferenceClient
-from common.clients.qdrant import VectorClient
 from common.clients.postgres import get_sessionmaker
 from projects.syntraflow.src.ingestion import (
     ingest_document_pipeline,

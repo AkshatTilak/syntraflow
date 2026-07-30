@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Dict, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from common.models.hub_enums import STORE_TYPES
 from projects.syntraflow.src.datastores.crypto import mask_uri
 
 

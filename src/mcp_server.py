@@ -4,14 +4,12 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 from mcp.server.fastmcp import FastMCP
-from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from common.config.settings import settings
 from common.clients.inference import InferenceClient
 from common.clients.qdrant import VectorClient
 from projects.syntraflow.src.retrieval import RetrievalEngine
-from common.clients.postgres import get_async_db as get_db
 
 # Initialize FastMCP Server
 mcp = FastMCP("SyntraFlow")
