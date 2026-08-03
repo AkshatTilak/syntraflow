@@ -111,6 +111,15 @@ async def process_ingestion_job(
 
 async def run_ingestion_consumer(app) -> None:
     """Run Kafka consumer loop for syntraflow-ingestion-jobs."""
+    try:
+        import socket
+        host, port = settings.KAFKA_BOOTSTRAP_SERVERS.split(":")[0], int(settings.KAFKA_BOOTSTRAP_SERVERS.split(":")[1]) if ":" in settings.KAFKA_BOOTSTRAP_SERVERS else 9092
+        with socket.create_connection((host, port), timeout=0.2):
+            pass
+    except Exception:
+        logger.info("Kafka broker (%s) is offline. SyntraFlow will use local background execution.", settings.KAFKA_BOOTSTRAP_SERVERS)
+        return
+
     logger.info("Initializing SyntraFlow Kafka Ingestion Consumer...")
     try:
         from confluent_kafka import Consumer, KafkaError
