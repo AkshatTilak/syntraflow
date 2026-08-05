@@ -14,6 +14,7 @@ from common.config.settings import get_settings
 from common.models.database import Hub
 from projects.syntraflow.src.collections.schemas import CollectionRetrievalConfig
 from projects.syntraflow.src.database.models import SyntraFlowCollection, SyntraFlowDocument, SyntraFlowChunk
+from projects.syntraflow.src.datastores.validator import validate_datastore_binding
 
 logger = logging.getLogger("syntraflow.collections.manager")
 
@@ -85,6 +86,9 @@ class CollectionManager:
         hub = await self._resolve_hub(hub_id)
         valid_name = validate_collection_name(name)
 
+        # Validate datastore binding connectivity for the ingestion hub
+        await validate_datastore_binding(self.db, hub_id, datastore_binding_id, store_type="qdrant")
+
         # Check per-hub name uniqueness
         stmt_exist = select(SyntraFlowCollection).where(
             SyntraFlowCollection.hub_id == hub_id,
@@ -123,6 +127,10 @@ class CollectionManager:
                 raise CollectionProvisioningError(f"Failed to provision vector collection: {e}")
 
         # Insert SQL metadata row with compensation handling
+        db_binding_id = datastore_binding_id
+        if db_binding_id and (db_binding_id.startswith("platform-default") or db_binding_id.lower() in ("default", "none")):
+            db_binding_id = None
+
         try:
             col_record = SyntraFlowCollection(
                 id=str(uuid.uuid4()),
@@ -133,7 +141,7 @@ class CollectionManager:
                 vector_dimension=float(vector_dimension),
                 description=description,
                 retrieval_config_json=parsed_config.model_dump(),
-                datastore_binding_id=datastore_binding_id,
+                datastore_binding_id=db_binding_id,
             )
             self.db.add(col_record)
             await self.db.flush()
@@ -265,7 +273,10 @@ class CollectionManager:
         if description is not None:
             rec.description = description
         if datastore_binding_id is not None:
-            rec.datastore_binding_id = datastore_binding_id
+            if datastore_binding_id.startswith("platform-default") or datastore_binding_id.lower() in ("default", "none"):
+                rec.datastore_binding_id = None
+            else:
+                rec.datastore_binding_id = datastore_binding_id
         if retrieval_config is not None:
             parsed = CollectionRetrievalConfig(**retrieval_config)
             rec.retrieval_config_json = parsed.model_dump()

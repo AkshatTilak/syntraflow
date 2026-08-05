@@ -26,7 +26,7 @@ async def process_ingestion_job(
     file_hash: str,
     filename: str,
     temp_filepath: str,
-    is_video_audio: bool,
+    is_video_audio: bool = False,
     *,
     hub_id: str,
     collection_id: str,
