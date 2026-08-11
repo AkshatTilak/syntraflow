@@ -7,7 +7,7 @@ temporal alignment, chunking, jina-clip embeddings, and DB writes.
 import base64
 import json
 import logging
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from qdrant_client.http.models import PointStruct
 
@@ -37,11 +37,71 @@ async def extract_layout_ocr(
         return await _extract_layout_ocr_inner(file_bytes, filename, client)
 
 
+def extract_pdf_text(file_bytes: bytes) -> str:
+    """Extract text directly from PDF file bytes using pypdf, fitz, or regex stream fallback."""
+    if not file_bytes or not file_bytes.startswith(b"%PDF"):
+        return ""
+
+    # 1. Try pypdf
+    try:
+        import pypdf
+        import io
+        reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+        pages_text = []
+        for i, page in enumerate(reader.pages):
+            txt = page.extract_text()
+            if txt and txt.strip():
+                pages_text.append(f"## Page {i+1}\n\n{txt.strip()}")
+        if pages_text:
+            return "\n\n".join(pages_text)
+    except Exception as e:
+        logger.debug("pypdf extraction skipped: %s", e)
+
+    # 2. Try fitz (PyMuPDF)
+    try:
+        import fitz
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        pages_text = []
+        for i, page in enumerate(doc):
+            txt = page.get_text()
+            if txt and txt.strip():
+                pages_text.append(f"## Page {i+1}\n\n{txt.strip()}")
+        if pages_text:
+            return "\n\n".join(pages_text)
+    except Exception:
+        pass
+
+    # 3. Stream regex fallback
+    try:
+        import re
+        matches = re.findall(r"\(([^)]+)\)\s*(?:Tj|TJ)", file_bytes.decode("latin1", errors="ignore"))
+        if matches:
+            text = " ".join(matches).strip()
+            if len(text) > 30:
+                return text
+    except Exception:
+        pass
+
+    return ""
+
+
 async def _extract_layout_ocr_inner(
     file_bytes: bytes,
     filename: str,
     client: InferenceClient,
 ) -> dict:
+    # 0. Check direct PDF text extraction first if valid PDF
+    if file_bytes and file_bytes.startswith(b"%PDF"):
+        pdf_text = extract_pdf_text(file_bytes)
+        if pdf_text and pdf_text.strip():
+            logger.info("Successfully extracted %d chars directly from PDF '%s'", len(pdf_text), filename)
+            return {
+                "text": pdf_text,
+                "blocks": [{"type": "paragraph", "content": pdf_text}],
+                "tables": [],
+                "layout": {}
+            }
+
     from common.models.registry import get_active_model
 
     model_spec = await get_active_model("ocr")
@@ -285,7 +345,7 @@ def chunk_document_layout_aware(
     return chunks
 
 
-async def extract_graph_entities(text: str) -> dict:
+async def extract_graph_entities(text: str, model_id: Optional[str] = None) -> dict:
     """Extract entities and relationships from chunk text for Neo4j GraphRAG."""
     prompt = (
         "You are an information extraction assistant. Extract key entities and relationships from this text.\n"
@@ -298,12 +358,13 @@ async def extract_graph_entities(text: str) -> dict:
         f"Text:\n{text}"
     )
     
-    try:
-        from common.models.registry import get_active_model
-        comp_model = await get_active_model("completion")
-        model_id = comp_model.model_id
-    except Exception:
-        model_id = "gemini/gemini-3.5-flash"
+    if not model_id:
+        try:
+            from common.models.registry import get_active_model
+            comp_model = await get_active_model("completion")
+            model_id = comp_model.model_id
+        except Exception:
+            model_id = "gemini/gemini-3.5-flash"
         
     try:
         response = await completion_with_fallback(
@@ -667,6 +728,7 @@ async def ingest_document_pipeline(
     chunk_overlap: int = 64,
     pre_processors: Optional[List[str]] = None,
     post_processors: Optional[List[str]] = None,
+    pipeline_config: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Ingest a multi-page PDF/image document with hub scoping, batching and Neo4j deduplication."""
     from fastapi import HTTPException
@@ -676,6 +738,19 @@ async def ingest_document_pipeline(
     # 0a. Collection Hub Validation
     collection = await assert_collection_in_hub(db, hub_id, collection_id)
     vector_client = await resolve_vector_client(db, hub_id)
+
+    cfg = dict(collection.pipeline_config_json or {})
+    if pipeline_config:
+        cfg.update(pipeline_config)
+
+    effective_ocr = cfg.get("ocr_engine")
+    effective_chunker = cfg.get("chunking_strategy") or chunker_type
+    effective_chunk_size = cfg.get("chunk_size") or chunk_size or 512
+    effective_chunk_overlap = cfg.get("chunk_overlap") or chunk_overlap or 64
+    effective_embedder = cfg.get("embedding_model") or collection.embedding_model or "jina-clip-v2"
+    effective_post_procs = cfg.get("post_processors") or post_processors or []
+    summary_model = cfg.get("summary_model")
+    graph_model = cfg.get("graph_model")
 
     tracer = trace.get_tracer("syntraflow")
     with tracer.start_as_current_span("syntraflow.ingest_document") as span:
@@ -696,9 +771,19 @@ async def ingest_document_pipeline(
                 except Exception as e:
                     logger.warning("Failed pre-processor '%s': %s", pre_name, e)
 
-        # 1. Extract Layout and text using OCR
-        ocr_result = await extract_layout_ocr(file_bytes, filename, inference_client)
-        extracted_text = ocr_result.get("text", "")
+        # 1. Extract Layout and text using OCR (dynamic engine)
+        ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+        if effective_ocr == "direct" or (not effective_ocr and ext in ("txt", "md", "json", "csv", "log")):
+            try:
+                extracted_text = file_bytes.decode("utf-8")
+                ocr_result = {"text": extracted_text, "blocks": [], "tables": [], "layout": {}}
+            except Exception:
+                ocr_result = await extract_layout_ocr(file_bytes, filename, inference_client)
+                extracted_text = ocr_result.get("text", "")
+        else:
+            ocr_result = await extract_layout_ocr(file_bytes, filename, inference_client)
+            extracted_text = ocr_result.get("text", "")
+
         await update_job(db, job_id, progress=0.4, status="processing")
         
         # 2. Save Document to Postgres
@@ -744,11 +829,11 @@ async def ingest_document_pipeline(
                 logger.error("Failed to link document ID to job: %s", job_err)
         
         # 3. Dynamic Chunking Strategy
-        if chunker_type and chunker_type.strip():
+        if effective_chunker and effective_chunker.strip():
             from projects.syntraflow.src.ingestion.strategies import ChunkerConfig
             from projects.syntraflow.src.ingestion.chunkers import get_chunker
-            cfg = ChunkerConfig(strategy=chunker_type, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-            chunker_instance = get_chunker(cfg)
+            chunk_cfg = ChunkerConfig(strategy=effective_chunker, chunk_size=effective_chunk_size, chunk_overlap=effective_chunk_overlap)
+            chunker_instance = get_chunker(chunk_cfg)
             raw_chunks = chunker_instance.chunk(extracted_text or "Empty document")
             chunks_data = [
                 {
@@ -756,7 +841,7 @@ async def ingest_document_pipeline(
                     "metadata": {
                         "hierarchy": [],
                         "bbox_list": [],
-                        "strategy": item.get("strategy", chunker_type),
+                        "strategy": item.get("strategy", effective_chunker),
                     },
                 }
                 for item in raw_chunks
@@ -768,25 +853,28 @@ async def ingest_document_pipeline(
             chunks_data = [{"text": extracted_text or "Empty document", "metadata": {"hierarchy": [], "bbox_list": []}}]
 
         # 3b. Post-processing Enrichment
-        if post_processors:
+        if effective_post_procs:
             from projects.syntraflow.src.ingestion.processors import get_post_processor
-            for post_name in post_processors:
-                post_proc = get_post_processor(post_name)
-                for idx in range(len(chunks_data)):
-                    chunks_data[idx] = post_proc.enrich(chunks_data[idx])
-                logger.info("Executed post-processor '%s' on %d chunks", post_name, len(chunks_data))
-            
-        # 4. Generate Embeddings in batch
+            for post_name in effective_post_procs:
+                try:
+                    post_proc = get_post_processor(post_name)
+                    for idx in range(len(chunks_data)):
+                        chunks_data[idx] = post_proc.enrich(chunks_data[idx])
+                    logger.info("Executed post-processor '%s' on %d chunks", post_name, len(chunks_data))
+                except Exception as pe:
+                    logger.warning("Failed to run post-processor '%s': %s", post_name, pe)
+
+        # 4. Generate Embeddings in batch using effective_embedder
         chunk_texts = [c["text"] for c in chunks_data]
         try:
             all_embeddings = []
             batch_size = 32
             for i in range(0, len(chunk_texts), batch_size):
                 batch_texts = chunk_texts[i:i+batch_size]
-                embeds = await inference_client.embed(texts=batch_texts)
+                embeds = await inference_client.embed(texts=batch_texts, model=effective_embedder)
                 all_embeddings.extend(embeds)
         except Exception as e:
-            logger.warning("Failed to generate embeddings via inference client: %s. Using fallback zero-vectors.", e)
+            logger.warning("Failed to generate embeddings via inference client with model %s: %s. Using fallback zero-vectors.", effective_embedder, e)
             dim = int(collection.vector_dimension) if collection.vector_dimension else 1024
             all_embeddings = [[0.0] * dim for _ in chunk_texts]
 
@@ -812,7 +900,7 @@ async def ingest_document_pipeline(
                 text=chunk_text,
                 metadata_json=json.dumps({
                     "filename": filename,
-                    "ocr_provider": settings.OCR_PROVIDER,
+                    "ocr_provider": effective_ocr or settings.OCR_PROVIDER,
                     "hierarchy": chunk_meta.get("hierarchy", []),
                     "bbox_list": chunk_meta.get("bbox_list", [])
                 })
@@ -854,18 +942,19 @@ async def ingest_document_pipeline(
                 
         await update_job(db, job_id, progress=0.7, status="processing")
 
-        # 5. Parallel KG Entity Extraction per chunk
-        import asyncio
-        sem = asyncio.Semaphore(5)
-        async def sem_extract(txt):
-            async with sem:
-                return await extract_graph_entities(txt)
-                
-        tasks = [sem_extract(txt) for txt in chunk_texts]
-        extractions = await asyncio.gather(*tasks)
-        
-        # Write deduplicated entities to Neo4j
-        await write_to_neo4j(extractions, document_id=str(doc.id), hub_id=hub_id, collection_id=collection_id, db=db)
+        # 5. Parallel KG Entity Extraction per chunk if kg_extract in post_processors or enable_knowledge_graph
+        if "kg_extract" in effective_post_procs or cfg.get("enable_knowledge_graph"):
+            import asyncio
+            sem = asyncio.Semaphore(5)
+            async def sem_extract(txt):
+                async with sem:
+                    return await extract_graph_entities(txt, model_id=graph_model)
+                    
+            tasks = [sem_extract(txt) for txt in chunk_texts]
+            extractions = await asyncio.gather(*tasks)
+            
+            # Write deduplicated entities to Neo4j
+            await write_to_neo4j(extractions, document_id=str(doc.id), hub_id=hub_id, collection_id=collection_id, db=db)
         
         await update_job(db, job_id, progress=1.0, status="completed")
         return doc.id
@@ -880,6 +969,7 @@ async def ingest_video_pipeline(
     hub_id: str,
     collection_id: str,
     job_id: Optional[Any] = None,
+    pipeline_config: Optional[Dict[str, Any]] = None,
 ) -> List[Any]:
     """Ingest MP4 Video/Audio files with FFmpeg demuxing, keyframes description, and alignment."""
     from fastapi import HTTPException
@@ -1004,7 +1094,7 @@ async def ingest_video_pipeline(
             batch_size = 32
             for i in range(0, len(summaries_to_embed), batch_size):
                 batch_texts = summaries_to_embed[i:i+batch_size]
-                embeds = await inference_client.embed(texts=batch_texts)
+                embeds = await inference_client.embed(texts=batch_texts, model=collection.embedding_model)
                 all_embeddings.extend(embeds)
         except Exception as e:
             logger.warning("Failed to embed video segments: %s. Using fallback zero-vectors.", e)

@@ -6,14 +6,14 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from qdrant_client.http import models as qdrant_models
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.clients.qdrant import VectorClient
 from common.config.settings import get_settings
 from common.models.database import Hub
 from projects.syntraflow.src.collections.schemas import CollectionRetrievalConfig
-from projects.syntraflow.src.database.models import SyntraFlowCollection, SyntraFlowDocument, SyntraFlowChunk
+from projects.syntraflow.src.database.models import SyntraFlowCollection, SyntraFlowDocument, SyntraFlowChunk, SyntraFlowJob
 from projects.syntraflow.src.datastores.validator import validate_datastore_binding
 
 logger = logging.getLogger("syntraflow.collections.manager")
@@ -36,11 +36,16 @@ def physical_collection_name(hub_slug: str, name: str) -> str:
 
 def validate_collection_name(name: str) -> str:
     """Validate friendly collection name format."""
-    if not name or not _NAME_RE.match(name) or "__" in name:
+    if not name:
+        raise ValueError("Collection name cannot be empty.")
+    if "__" in name:
+        raise ValueError("Collection name cannot contain '__'.")
+    name_clean = name.strip()
+    if not _NAME_RE.match(name_clean):
         raise ValueError(
-            f"Invalid collection name '{name}'. Must be 1-63 alphanumeric/space/dash/underscore chars and cannot contain '__'."
+            f"Invalid collection name '{name}'. Must be 1-63 alphanumeric/space/dash/underscore chars."
         )
-    return name.strip()
+    return name_clean
 
 
 class CollectionManager:
@@ -80,6 +85,7 @@ class CollectionManager:
         vector_dimension: int = 1024,
         description: Optional[str] = None,
         retrieval_config: Optional[Dict[str, Any]] = None,
+        pipeline_config: Optional[Dict[str, Any]] = None,
         datastore_binding_id: Optional[str] = None,
     ) -> SyntraFlowCollection:
         """Create a new dynamic vector collection in Qdrant and store metadata in SQL."""
@@ -141,6 +147,7 @@ class CollectionManager:
                 vector_dimension=float(vector_dimension),
                 description=description,
                 retrieval_config_json=parsed_config.model_dump(),
+                pipeline_config_json=pipeline_config or {},
                 datastore_binding_id=db_binding_id,
             )
             self.db.add(col_record)
@@ -193,8 +200,11 @@ class CollectionManager:
                 "vector_dimension": int(rec.vector_dimension),
                 "description": rec.description,
                 "retrieval_config": rec.retrieval_config_json or {},
+                "pipeline_config": rec.pipeline_config_json or {},
                 "datastore_binding_id": rec.datastore_binding_id,
                 "points_count": points_count,
+                "vectors_count": points_count,
+                "vector_count": points_count,
                 "status": status,
                 "created_at": rec.created_at.isoformat() if rec.created_at else None,
             })
@@ -239,6 +249,7 @@ class CollectionManager:
             "vector_dimension": int(rec.vector_dimension),
             "description": rec.description,
             "retrieval_config": rec.retrieval_config_json or {},
+            "pipeline_config": rec.pipeline_config_json or {},
             "datastore_binding_id": rec.datastore_binding_id,
             "points_count": points_count,
             "vectors_count": vectors_count,
@@ -253,9 +264,10 @@ class CollectionManager:
         collection_id: str,
         description: Optional[str] = None,
         retrieval_config: Optional[Dict[str, Any]] = None,
+        pipeline_config: Optional[Dict[str, Any]] = None,
         datastore_binding_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Update collection metadata and retrieval strategy configuration."""
+        """Update collection metadata, retrieval strategy, and pipeline configuration."""
         await self._resolve_hub(hub_id)
 
         stmt = select(SyntraFlowCollection).where(SyntraFlowCollection.hub_id == hub_id)
@@ -280,6 +292,8 @@ class CollectionManager:
         if retrieval_config is not None:
             parsed = CollectionRetrievalConfig(**retrieval_config)
             rec.retrieval_config_json = parsed.model_dump()
+        if pipeline_config is not None:
+            rec.pipeline_config_json = pipeline_config
 
         await self.db.commit()
         await self.db.refresh(rec)
@@ -290,7 +304,7 @@ class CollectionManager:
         *,
         hub_id: str,
         collection_id: str,
-        force: bool = False,
+        force: bool = True,
     ) -> Dict[str, Any]:
         """Delete collection from vector store and SQL database with delete safety checks."""
         await self._resolve_hub(hub_id)
@@ -307,17 +321,41 @@ class CollectionManager:
         if not rec:
             raise ValueError(f"Collection '{collection_id}' not found in this hub.")
 
-        # Check associated documents count for delete safety
-        doc_stmt = select(func.count(SyntraFlowDocument.id)).where(SyntraFlowDocument.hub_id == hub_id)
+        # Check associated documents count for delete safety (scoped to this collection)
+        doc_stmt = select(func.count(SyntraFlowDocument.id)).where(
+            SyntraFlowDocument.hub_id == hub_id,
+            SyntraFlowDocument.collection_id == str(rec.id),
+        )
         doc_res = await self.db.execute(doc_stmt)
         doc_count = doc_res.scalar() or 0
 
         if doc_count > 0 and not force:
             raise ValueError(f"Collection '{rec.name}' is not empty ({doc_count} documents). Pass force=True to delete.")
 
-        # Count chunks
-        chunk_stmt = select(func.count(SyntraFlowChunk.id)).where(SyntraFlowChunk.hub_id == hub_id)
+        # Count chunks associated with this collection
+        chunk_stmt = (
+            select(func.count(SyntraFlowChunk.id))
+            .join(SyntraFlowDocument, SyntraFlowChunk.document_id == SyntraFlowDocument.id)
+            .where(
+                SyntraFlowDocument.hub_id == hub_id,
+                SyntraFlowDocument.collection_id == str(rec.id),
+            )
+        )
         chunk_count = (await self.db.execute(chunk_stmt)).scalar() or 0
+
+        # If force delete and documents exist, remove jobs and documents for this collection
+        if doc_count > 0 and force:
+            job_del_stmt = delete(SyntraFlowJob).where(
+                SyntraFlowJob.hub_id == hub_id,
+                SyntraFlowJob.collection_id == str(rec.id),
+            )
+            await self.db.execute(job_del_stmt)
+
+            doc_del_stmt = delete(SyntraFlowDocument).where(
+                SyntraFlowDocument.hub_id == hub_id,
+                SyntraFlowDocument.collection_id == str(rec.id),
+            )
+            await self.db.execute(doc_del_stmt)
 
         # Delete physical vector collection
         if self.vector_client:

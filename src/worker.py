@@ -35,6 +35,7 @@ async def process_ingestion_job(
     chunk_overlap: int = 64,
     pre_processors: Optional[list[str]] = None,
     post_processors: Optional[list[str]] = None,
+    pipeline_config: Optional[dict] = None,
 ) -> None:
     """Load file bytes from disk, execute the hub-scoped ingestion pipeline, and clean up."""
     logger.info(
@@ -59,7 +60,7 @@ async def process_ingestion_job(
             # 2. Setup inference client
             inference_client = InferenceClient(base_url=settings.INFERENCE_SERVER_URL)
 
-            # 3. Route to proper pipeline with hub_id and collection_id
+            # 3. Route to proper pipeline with hub_id, collection_id, and pipeline_config
             if is_video_audio:
                 await ingest_video_pipeline(
                     video_bytes=file_bytes,
@@ -69,6 +70,7 @@ async def process_ingestion_job(
                     hub_id=hub_id,
                     collection_id=collection_id,
                     job_id=job_id,
+                    pipeline_config=pipeline_config,
                 )
             else:
                 await ingest_document_pipeline(
@@ -84,6 +86,7 @@ async def process_ingestion_job(
                     chunk_overlap=chunk_overlap,
                     pre_processors=pre_processors,
                     post_processors=post_processors,
+                    pipeline_config=pipeline_config,
                 )
             logger.info("Successfully completed Ingestion Job: %s", job_id)
 

@@ -145,13 +145,37 @@ class RetrievalEngine:
         score_threshold = config.get("score_threshold")
 
         try:
-            hits_raw = vector_client.get_client().search(
-                collection_name=collection.physical_name,
-                query_vector=query_vector,
-                limit=limit,
-                query_filter=qdrant_filter,
-                score_threshold=score_threshold,
-            )
+            client = vector_client.get_client()
+            hits_raw = []
+
+            # 1. Try query_points (qdrant-client >= 1.10)
+            if hasattr(client, "query_points"):
+                try:
+                    res = client.query_points(
+                        collection_name=collection.physical_name,
+                        query=query_vector,
+                        limit=limit,
+                        query_filter=qdrant_filter,
+                        score_threshold=score_threshold,
+                    )
+                    if hasattr(res, "points") and isinstance(res.points, list):
+                        hits_raw = res.points
+                    elif isinstance(res, list):
+                        hits_raw = res
+                except Exception:
+                    pass
+
+            # 2. Fallback to search (qdrant-client < 1.10 or legacy mock)
+            if not hits_raw and hasattr(client, "search"):
+                res = client.search(
+                    collection_name=collection.physical_name,
+                    query_vector=query_vector,
+                    limit=limit,
+                    query_filter=qdrant_filter,
+                    score_threshold=score_threshold,
+                )
+                if isinstance(res, list):
+                    hits_raw = res
 
             hits = []
             for item in hits_raw:
@@ -188,7 +212,7 @@ class RetrievalEngine:
         limit: int = 5,
         metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        """Perform sparse BM25 search. Raises 409 if no sparse index exists."""
+        """Perform sparse BM25 keyword search with SQL fallback."""
         config = {}
         if collection.retrieval_config_json:
             try:
@@ -196,44 +220,114 @@ class RetrievalEngine:
             except Exception:
                 pass
 
-        if not config.get("sparse_index_enabled", False):
+        if not config.get("sparse_index_enabled", False) and collection.retrieval_config_json is not None:
             raise HTTPException(status_code=409, detail="Collection has no sparse index")
 
-        # Sparse vector search via Qdrant
-        vector_client = await resolve_vector_client(self.db, self.hub_id)
-        qdrant_filter = self._hub_filter(
-            collection_id=collection.id, metadata_filter=metadata_filter
-        )
+        hits = []
+        if config.get("sparse_index_enabled", False):
+            try:
+                vector_client = await resolve_vector_client(self.db, self.hub_id)
+                qdrant_filter = self._hub_filter(
+                    collection_id=collection.id, metadata_filter=metadata_filter
+                )
+                client = vector_client.get_client()
+                hits_raw = []
 
-        try:
-            hits_raw = vector_client.get_client().search(
-                collection_name=collection.physical_name,
-                query_vector=qdrant_models.NamedSparseVector(
-                    name="sparse",
-                    vector=qdrant_models.SparseVector(indices=[1, 2], values=[1.0, 1.0]),
-                ),
-                limit=limit,
-                query_filter=qdrant_filter,
-            )
-            hits = []
-            for item in hits_raw:
-                payload = item.payload or {}
-                hits.append({
-                    "id": str(item.id),
-                    "score": float(item.score),
-                    "text": payload.get("text", ""),
-                    "metadata": payload,
-                    "collection_id": collection.id,
-                    "collection_name": collection.name,
-                    "hub_id": self.hub_id,
-                    "strategy": "sparse",
-                })
-            return hits
-        except DatastoreUnavailableError:
-            raise
-        except Exception as e:
-            logger.warning("Sparse search failed for collection '%s': %s", collection.physical_name, e)
-            raise HTTPException(status_code=409, detail="Collection has no sparse index")
+                if hasattr(client, "query_points"):
+                    try:
+                        res = client.query_points(
+                            collection_name=collection.physical_name,
+                            query=qdrant_models.NamedSparseVector(
+                                name="sparse",
+                                vector=qdrant_models.SparseVector(indices=[1, 2], values=[1.0, 1.0]),
+                            ),
+                            limit=limit,
+                            query_filter=qdrant_filter,
+                        )
+                        if hasattr(res, "points") and isinstance(res.points, list):
+                            hits_raw = res.points
+                        elif isinstance(res, list):
+                            hits_raw = res
+                    except Exception:
+                        pass
+
+                if not hits_raw and hasattr(client, "search"):
+                    res = client.search(
+                        collection_name=collection.physical_name,
+                        query_vector=qdrant_models.NamedSparseVector(
+                            name="sparse",
+                            vector=qdrant_models.SparseVector(indices=[1, 2], values=[1.0, 1.0]),
+                        ),
+                        limit=limit,
+                        query_filter=qdrant_filter,
+                    )
+                    if isinstance(res, list):
+                        hits_raw = res
+
+                for item in hits_raw:
+                    payload = item.payload or {}
+                    hits.append({
+                        "id": str(item.id),
+                        "score": float(item.score),
+                        "text": payload.get("text", ""),
+                        "metadata": payload,
+                        "collection_id": collection.id,
+                        "collection_name": collection.name,
+                        "hub_id": self.hub_id,
+                        "strategy": "sparse",
+                    })
+            except Exception as e:
+                logger.debug("Qdrant sparse search skipped: %s", e)
+
+        # Fallback to SQL keyword BM25 matching on chunk text
+        if not hits:
+            import re
+            from sqlalchemy import select, or_
+            from projects.syntraflow.src.database.models import SyntraFlowChunk, SyntraFlowDocument
+
+            terms = [t.lower() for t in re.findall(r"\w+", query) if len(t) > 1]
+            if terms:
+                conditions = [SyntraFlowChunk.text.ilike(f"%{t}%") for t in terms]
+                stmt = (
+                    select(SyntraFlowChunk, SyntraFlowDocument.filename)
+                    .join(SyntraFlowDocument, SyntraFlowChunk.document_id == SyntraFlowDocument.id)
+                    .where(
+                        SyntraFlowChunk.hub_id == self.hub_id,
+                        SyntraFlowDocument.collection_id == collection.id,
+                        or_(*conditions)
+                    )
+                    .limit(limit * 3)
+                )
+                try:
+                    res = await self.db.execute(stmt)
+                    rows = res.all()
+
+                    sql_hits = []
+                    for chunk, filename in rows:
+                        text_lower = chunk.text.lower()
+                        term_matches = sum(text_lower.count(t) for t in terms)
+                        score = min(1.0, 0.5 + (term_matches * 0.1))
+                        sql_hits.append({
+                            "id": str(chunk.id),
+                            "score": round(score, 4),
+                            "text": chunk.text,
+                            "metadata": {
+                                "filename": filename,
+                                "document_id": str(chunk.document_id) if chunk.document_id else "",
+                                "tags": [],
+                                "access_level": "read",
+                            },
+                            "collection_id": collection.id,
+                            "collection_name": collection.name,
+                            "hub_id": self.hub_id,
+                            "strategy": "sparse",
+                        })
+                    sql_hits.sort(key=lambda x: x["score"], reverse=True)
+                    hits = sql_hits[:limit]
+                except Exception as sqle:
+                    logger.warning("SQL BM25 fallback search failed: %s", sqle)
+
+        return hits
 
     async def search_graph(
         self,
@@ -246,12 +340,12 @@ class RetrievalEngine:
             driver = await resolve_graph_client(self.db, self.hub_id)
             cypher_query = (
                 "MATCH (e:SyntraFlow_Entity {hub_id: $hub_id})-[r:SyntraFlow_RELATION]->(o:SyntraFlow_Entity {hub_id: $hub_id}) "
-                "WHERE (e.name CONTAINS $query OR o.name CONTAINS $query) AND ($col_id IS NULL OR e.collection_id = $col_id) "
+                "WHERE (toLower(e.name) CONTAINS toLower($search_query) OR toLower(o.name) CONTAINS toLower($search_query)) AND ($col_id IS NULL OR e.collection_id = $col_id) "
                 "RETURN e.name AS source, o.name AS target, r.type AS rel_type, r.description AS desc "
                 "LIMIT $limit"
             )
             async with driver.session() as session:
-                res = await session.run(cypher_query, hub_id=self.hub_id, query=query, col_id=collection.id, limit=limit)
+                res = await session.run(cypher_query, hub_id=self.hub_id, search_query=query, col_id=collection.id, limit=limit)
                 records = await res.data()
 
             hits = []
@@ -288,7 +382,7 @@ class RetrievalEngine:
         metadata_filter: Optional[Dict[str, Any]] = None,
         rrf_k: int = 60,
     ) -> List[Dict[str, Any]]:
-        """Perform Hybrid RRF search combining Dense vector and Sparse/Graph hits."""
+        """Perform Hybrid RRF search combining Dense vector, Sparse BM25, and Graph hits."""
         dense_hits = await self.search_vector(
             collection=collection, query_vector=query_vector, limit=limit * 2, metadata_filter=metadata_filter
         )
@@ -296,8 +390,10 @@ class RetrievalEngine:
             sparse_hits = await self.search_sparse(
                 collection=collection, query=query, limit=limit * 2, metadata_filter=metadata_filter
             )
-        except HTTPException:
-            sparse_hits = await self.search_graph(collection=collection, query=query, limit=limit * 2)
+        except Exception:
+            sparse_hits = []
+
+        graph_hits = await self.search_graph(collection=collection, query=query, limit=limit * 2)
 
         scores: Dict[str, float] = {}
         items_map: Dict[str, Dict[str, Any]] = {}
@@ -308,6 +404,12 @@ class RetrievalEngine:
             items_map[key] = hit
 
         for rank, hit in enumerate(sparse_hits):
+            key = hit["text"]
+            scores[key] = scores.get(key, 0.0) + (1.0 / (rank + rrf_k))
+            if key not in items_map:
+                items_map[key] = hit
+
+        for rank, hit in enumerate(graph_hits):
             key = hit["text"]
             scores[key] = scores.get(key, 0.0) + (1.0 / (rank + rrf_k))
             if key not in items_map:
@@ -340,15 +442,19 @@ class RetrievalEngine:
 
         # If query_vector not supplied, compute embedding
         if not query_vector:
+            dim = int(collections[0].vector_dimension) if collections and collections[0].vector_dimension else 768
             try:
                 from common.clients.inference import InferenceClient
                 inf_client = InferenceClient(base_url=settings.INFERENCE_SERVER_URL)
-                embeds = await inf_client.embed(texts=[query])
-                query_vector = embeds[0]
-                await inf_client.close()
+                target_model = collections[0].embedding_model if collections else None
+                embeds = await inf_client.embed(texts=[query], model=target_model)
+                if embeds and len(embeds[0]) > 0:
+                    query_vector = embeds[0]
+                else:
+                    query_vector = [0.0] * dim
             except Exception as e:
-                logger.warning("Inference client embedding failed in search: %s. Using zero vector.", e)
-                query_vector = [0.0] * 1024
+                logger.warning("Inference client embedding failed in search: %s. Using zero vector of dim %d.", e, dim)
+                query_vector = [0.0] * dim
 
         async def _search_collection(col: SyntraFlowCollection) -> List[Dict[str, Any]]:
             # Determine effective strategy

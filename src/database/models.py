@@ -54,7 +54,7 @@ class SyntraFlowChunk(HubScopedMixin, Base):
     __tablename__ = "syntraflow_chunks"
 
     id = Column(Uuid, primary_key=True, default=uuid.uuid4)
-    document_id = Column(Uuid, ForeignKey("syntraflow_documents.id"), nullable=True, index=True)
+    document_id = Column(Uuid, ForeignKey("syntraflow_documents.id", ondelete="CASCADE"), nullable=True, index=True)
     chunk_index = Column(Float, nullable=False)
     text = Column(Text, nullable=False)
     image_path = Column(String(512), nullable=True)
@@ -73,7 +73,7 @@ class SyntraFlowVideoSegment(HubScopedMixin, Base):
     __tablename__ = "syntraflow_video_segments"
 
     id = Column(Uuid, primary_key=True, default=uuid.uuid4)
-    document_id = Column(Uuid, ForeignKey("syntraflow_documents.id"), nullable=True, index=True)
+    document_id = Column(Uuid, ForeignKey("syntraflow_documents.id", ondelete="CASCADE"), nullable=True, index=True)
     video_name = Column(String(255), nullable=False)
     start_time = Column(Float, nullable=False)
     end_time = Column(Float, nullable=False)
@@ -96,10 +96,11 @@ class SyntraFlowJob(HubScopedMixin, Base):
 
     id = Column(Uuid, primary_key=True, default=uuid.uuid4)
     collection_id = Column(String(36), ForeignKey("syntraflow_collections.id", ondelete="CASCADE"), nullable=False, index=True)
-    document_id = Column(Uuid, ForeignKey("syntraflow_documents.id"), nullable=True)
+    document_id = Column(Uuid, ForeignKey("syntraflow_documents.id", ondelete="CASCADE"), nullable=True)
     status = Column(String(20), nullable=False, default="queued")  # queued, processing, completed, failed
     progress = Column(Float, default=0.0)
     error_msg = Column(Text, nullable=True)
+    pipeline_config_json = Column(JSON, nullable=True, default=dict)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -125,6 +126,7 @@ class SyntraFlowCollection(HubScopedMixin, Base):
     vector_dimension = Column(Float, nullable=False, default=1024)
     description = Column(Text, nullable=True)
     retrieval_config_json = Column(JSON, nullable=False, default=dict)
+    pipeline_config_json = Column(JSON, nullable=True, default=dict)
     datastore_binding_id = Column(String(36), ForeignKey("datastore_bindings.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
