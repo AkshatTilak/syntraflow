@@ -119,6 +119,8 @@ class CollectionManager:
         if self.vector_client:
             try:
                 qdrant = self.vector_client.get_client()
+                if qdrant.collection_exists(physical_name):
+                    qdrant.delete_collection(physical_name)
                 qdrant.create_collection(
                     collection_name=physical_name,
                     vectors_config=qdrant_models.VectorParams(

@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from common.config.settings import settings
 from common.clients.inference import InferenceClient
@@ -36,6 +36,7 @@ async def process_ingestion_job(
     pre_processors: Optional[list[str]] = None,
     post_processors: Optional[list[str]] = None,
     pipeline_config: Optional[dict] = None,
+    db_session: Optional[Any] = None,
 ) -> None:
     """Load file bytes from disk, execute the hub-scoped ingestion pipeline, and clean up."""
     logger.info(
@@ -45,71 +46,120 @@ async def process_ingestion_job(
         hub_id,
         collection_id,
     )
-    SessionLocal = get_sessionmaker()
 
-    async with SessionLocal() as db:
-        inference_client = None
-        try:
-            # 1. Read file bytes
-            if not os.path.exists(temp_filepath):
-                raise FileNotFoundError(f"Source file not found at: {temp_filepath}")
-
-            with open(temp_filepath, "rb") as f:
-                file_bytes = f.read()
-
-            # 2. Setup inference client
-            inference_client = InferenceClient(base_url=settings.INFERENCE_SERVER_URL)
-
-            # 3. Route to proper pipeline with hub_id, collection_id, and pipeline_config
-            if is_video_audio:
-                await ingest_video_pipeline(
-                    video_bytes=file_bytes,
-                    video_name=filename,
-                    db=db,
-                    inference_client=inference_client,
-                    hub_id=hub_id,
-                    collection_id=collection_id,
-                    job_id=job_id,
-                    pipeline_config=pipeline_config,
-                )
-            else:
-                await ingest_document_pipeline(
-                    file_bytes=file_bytes,
-                    filename=filename,
-                    db=db,
-                    inference_client=inference_client,
-                    hub_id=hub_id,
-                    collection_id=collection_id,
-                    job_id=job_id,
-                    chunker_type=chunker_type,
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap,
-                    pre_processors=pre_processors,
-                    post_processors=post_processors,
-                    pipeline_config=pipeline_config,
-                )
-            logger.info("Successfully completed Ingestion Job: %s", job_id)
-
-        except Exception as e:
-            logger.error("Failed to execute Ingestion Job %s: %s", job_id, e)
-            await update_job(
+    if db_session is not None:
+        await _process_ingestion_job_inner(
+            db=db_session,
+            job_id=job_id,
+            filename=filename,
+            temp_filepath=temp_filepath,
+            is_video_audio=is_video_audio,
+            hub_id=hub_id,
+            collection_id=collection_id,
+            chunker_type=chunker_type,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            pre_processors=pre_processors,
+            post_processors=post_processors,
+            pipeline_config=pipeline_config,
+        )
+    else:
+        SessionLocal = get_sessionmaker()
+        async with SessionLocal() as db:
+            await _process_ingestion_job_inner(
                 db=db,
                 job_id=job_id,
-                progress=1.0,
-                status="failed",
-                error_msg=str(e),
+                filename=filename,
+                temp_filepath=temp_filepath,
+                is_video_audio=is_video_audio,
+                hub_id=hub_id,
+                collection_id=collection_id,
+                chunker_type=chunker_type,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                pre_processors=pre_processors,
+                post_processors=post_processors,
+                pipeline_config=pipeline_config,
             )
-        finally:
-            if inference_client:
-                await inference_client.close()
 
-            # Clean up temp upload file if applicable
-            if "temp_uploads" in temp_filepath and os.path.exists(temp_filepath):
-                try:
-                    os.remove(temp_filepath)
-                    logger.debug("Cleaned up temporary upload file: %s", temp_filepath)
-                except Exception as cleanup_err:
-                    logger.warning("Failed to remove temp file %s: %s", temp_filepath, cleanup_err)
+
+async def _process_ingestion_job_inner(
+    db: Any,
+    job_id: str,
+    filename: str,
+    temp_filepath: str,
+    is_video_audio: bool,
+    hub_id: str,
+    collection_id: str,
+    chunker_type: Optional[str],
+    chunk_size: int,
+    chunk_overlap: int,
+    pre_processors: Optional[list[str]],
+    post_processors: Optional[list[str]],
+    pipeline_config: Optional[dict],
+) -> None:
+    inference_client = None
+    try:
+        # 1. Read file bytes
+        if not os.path.exists(temp_filepath):
+            raise FileNotFoundError(f"Source file not found at: {temp_filepath}")
+
+        with open(temp_filepath, "rb") as f:
+            file_bytes = f.read()
+
+        # 2. Setup inference client
+        inference_client = InferenceClient(base_url=settings.INFERENCE_SERVER_URL)
+
+        # 3. Route to proper pipeline with hub_id, collection_id, and pipeline_config
+        if is_video_audio:
+            await ingest_video_pipeline(
+                video_bytes=file_bytes,
+                video_name=filename,
+                db=db,
+                inference_client=inference_client,
+                hub_id=hub_id,
+                collection_id=collection_id,
+                job_id=job_id,
+                pipeline_config=pipeline_config,
+            )
+        else:
+            await ingest_document_pipeline(
+                file_bytes=file_bytes,
+                filename=filename,
+                db=db,
+                inference_client=inference_client,
+                hub_id=hub_id,
+                collection_id=collection_id,
+                job_id=job_id,
+                chunker_type=chunker_type,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                pre_processors=pre_processors,
+                post_processors=post_processors,
+                pipeline_config=pipeline_config,
+            )
+        logger.info("Successfully completed Ingestion Job: %s", job_id)
+
+    except Exception as e:
+        logger.error("Failed to execute Ingestion Job %s: %s", job_id, e)
+        await update_job(
+            db=db,
+            job_id=job_id,
+            progress=1.0,
+            status="failed",
+            error_msg=str(e),
+        )
+    finally:
+        if inference_client:
+            await inference_client.close()
+
+        # Clean up temp upload file if applicable
+        if "temp_uploads" in temp_filepath and os.path.exists(temp_filepath):
+            try:
+                os.remove(temp_filepath)
+                logger.debug("Cleaned up temporary upload file: %s", temp_filepath)
+            except Exception as cleanup_err:
+                logger.warning("Failed to remove temp file %s: %s", temp_filepath, cleanup_err)
 
 
 async def run_ingestion_consumer(app) -> None:

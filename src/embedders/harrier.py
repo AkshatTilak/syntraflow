@@ -10,12 +10,18 @@ logger = logging.getLogger("syntraflow.embedders.harrier")
 class HarrierEmbedder:
     """Local Harrier 0.6B Embedding Model Wrapper.
     
-    Generates 768-dimensional text embeddings with CPU/GPU fallback resolution.
+    Generates model-specific Harrier embeddings with CPU/GPU fallback resolution.
     """
 
-    def __init__(self, device: str = "auto", dimension: int = 768) -> None:
+    def __init__(
+        self,
+        device: str = "auto",
+        model_id: str = "microsoft/harrier-oss-v1-0.6b",
+        dimension: int = 1024,
+    ) -> None:
         self.dimension = dimension
         self.device = device
+        self.model_id = model_id
         self._model = None
         self._initialized = False
 
@@ -29,7 +35,7 @@ class HarrierEmbedder:
             import torch
             resolved_device = "cuda" if (self.device == "auto" and torch.cuda.is_available()) else "cpu"
             logger.info("Loading Harrier 0.6B model on device: %s", resolved_device)
-            self._model = SentenceTransformer("BAAI/bge-base-en-v1.5", device=resolved_device)
+            self._model = SentenceTransformer(self.model_id, device=resolved_device)
             self._initialized = True
         except Exception as e:
             logger.warning("Could not load full SentenceTransformer for Harrier (%s). Using lightweight vector fallback.", e)
