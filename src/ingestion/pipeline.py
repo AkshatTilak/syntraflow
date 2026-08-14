@@ -675,18 +675,20 @@ async def update_job(
     if not job_id:
         return
     try:
-        from datetime import datetime
+        from datetime import datetime, timezone
+        import uuid as uuid_mod
         from sqlalchemy import update
         from projects.syntraflow.src.database.models import SyntraFlowJob
 
+        job_uuid = uuid_mod.UUID(str(job_id)) if isinstance(job_id, (str, uuid_mod.UUID)) else job_id
         stmt = (
             update(SyntraFlowJob)
-            .where(SyntraFlowJob.id == job_id)
+            .where(SyntraFlowJob.id == job_uuid)
             .values(
                 status=status,
                 progress=progress,
                 error_msg=error_msg,
-                updated_at=datetime.utcnow(),
+                updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
             )
         )
         await db.execute(stmt)
@@ -817,10 +819,12 @@ async def ingest_document_pipeline(
         if job_id:
             from projects.syntraflow.src.database.models import SyntraFlowJob
             from sqlalchemy import update
+            import uuid as uuid_mod
             try:
+                job_uuid = uuid_mod.UUID(str(job_id)) if isinstance(job_id, (str, uuid_mod.UUID)) else job_id
                 stmt = (
                     update(SyntraFlowJob)
-                    .where(SyntraFlowJob.id == job_id)
+                    .where(SyntraFlowJob.id == job_uuid)
                     .values(document_id=doc.id, hub_id=hub_id, collection_id=collection_id)
                 )
                 await db.execute(stmt)
@@ -1046,10 +1050,12 @@ async def ingest_video_pipeline(
         if job_id:
             from projects.syntraflow.src.database.models import SyntraFlowJob
             from sqlalchemy import update
+            import uuid as uuid_mod
             try:
+                job_uuid = uuid_mod.UUID(str(job_id)) if isinstance(job_id, (str, uuid_mod.UUID)) else job_id
                 stmt = (
                     update(SyntraFlowJob)
-                    .where(SyntraFlowJob.id == job_id)
+                    .where(SyntraFlowJob.id == job_uuid)
                     .values(document_id=doc.id, hub_id=hub_id, collection_id=collection_id)
                 )
                 await db.execute(stmt)
