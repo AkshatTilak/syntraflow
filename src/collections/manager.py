@@ -106,6 +106,17 @@ class CollectionManager:
 
         physical_name = physical_collection_name(hub.slug, valid_name)
 
+        # Release any orphaned physical collection in PostgreSQL from previously deleted hubs
+        stmt_phys = select(SyntraFlowCollection).where(
+            SyntraFlowCollection.physical_name == physical_name
+        )
+        res_phys = await self.db.execute(stmt_phys)
+        orphaned_col = res_phys.scalar_one_or_none()
+        if orphaned_col:
+            if orphaned_col.hub_id != hub_id:
+                await self.db.delete(orphaned_col)
+                await self.db.flush()
+
         # Process and validate retrieval config
         settings = get_settings()
         default_strategy = getattr(settings, "RAG_STRATEGY", "hybrid")

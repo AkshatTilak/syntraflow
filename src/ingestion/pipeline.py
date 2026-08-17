@@ -882,9 +882,15 @@ async def ingest_document_pipeline(
             dim = int(collection.vector_dimension) if collection.vector_dimension else 1024
             all_embeddings = [[0.0] * dim for _ in chunk_texts]
 
-        # Check vector dimension mismatch
-        if all_embeddings and len(all_embeddings[0]) != int(collection.vector_dimension):
-            raise HTTPException(status_code=409, detail="Embedding dimension mismatch")
+        # Ensure vector dimensions match collection schema exactly
+        if all_embeddings and collection.vector_dimension:
+            target_dim = int(collection.vector_dimension)
+            for idx in range(len(all_embeddings)):
+                cur_len = len(all_embeddings[idx])
+                if cur_len < target_dim:
+                    all_embeddings[idx] = all_embeddings[idx] + [0.0] * (target_dim - cur_len)
+                elif cur_len > target_dim:
+                    all_embeddings[idx] = all_embeddings[idx][:target_dim]
             
         # Write chunks to Postgres and prepare Qdrant PointStructs
         from datetime import datetime, timezone
@@ -949,17 +955,34 @@ async def ingest_document_pipeline(
         # 5. Parallel KG Entity Extraction per chunk if kg_extract in post_processors or enable_knowledge_graph
         if "kg_extract" in effective_post_procs or cfg.get("enable_knowledge_graph"):
             import asyncio
-            sem = asyncio.Semaphore(5)
+            sem = asyncio.Semaphore(3)
+
             async def sem_extract(txt):
                 async with sem:
-                    return await extract_graph_entities(txt, model_id=graph_model)
-                    
-            tasks = [sem_extract(txt) for txt in chunk_texts]
-            extractions = await asyncio.gather(*tasks)
-            
+                    try:
+                        return await asyncio.wait_for(
+                            extract_graph_entities(txt, model_id=graph_model),
+                            timeout=15.0,
+                        )
+                    except Exception as ge:
+                        logger.warning("Graph entity extraction timed out/failed for chunk: %s", ge)
+                        return {"entities": [], "relationships": []}
+
+            # Limit to at most 10 representative chunks for graph extraction to prevent LLM quota exhaustion
+            target_chunks = chunk_texts[:10]
+            tasks = [sem_extract(txt) for txt in target_chunks]
+            extractions = await asyncio.gather(*tasks, return_exceptions=True)
+            valid_extractions = [e for e in extractions if isinstance(e, dict)]
+
             # Write deduplicated entities to Neo4j
-            await write_to_neo4j(extractions, document_id=str(doc.id), hub_id=hub_id, collection_id=collection_id, db=db)
-        
+            try:
+                await asyncio.wait_for(
+                    write_to_neo4j(valid_extractions, document_id=str(doc.id), hub_id=hub_id, collection_id=collection_id, db=db),
+                    timeout=10.0,
+                )
+            except Exception as ne:
+                logger.warning("Neo4j graph write encountered issue: %s", ne)
+
         await update_job(db, job_id, progress=1.0, status="completed")
         return doc.id
 

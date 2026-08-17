@@ -141,7 +141,11 @@ async def _process_ingestion_job_inner(
         logger.info("Successfully completed Ingestion Job: %s", job_id)
 
     except Exception as e:
-        logger.error("Failed to execute Ingestion Job %s: %s", job_id, e)
+        logger.error("Failed to execute Ingestion Job %s: %s", job_id, e, exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
         await update_job(
             db=db,
             job_id=job_id,
