@@ -364,7 +364,7 @@ async def extract_graph_entities(text: str, model_id: Optional[str] = None) -> d
             comp_model = await get_active_model("completion")
             model_id = comp_model.model_id
         except Exception:
-            model_id = "gemini/gemini-3.5-flash"
+            model_id = "gemini/gemma-3-27b-it"
         
     try:
         response = await completion_with_fallback(
@@ -651,7 +651,7 @@ async def describe_keyframe(image_bytes: bytes, filename: str) -> str:
         comp_model = await get_active_model("completion")
         model_id = comp_model.model_id
     except Exception:
-        model_id = "gemini/gemini-3.5-flash"
+        model_id = "gemini/gemma-3-27b-it"
         
     try:
         response = await completion_with_fallback(
